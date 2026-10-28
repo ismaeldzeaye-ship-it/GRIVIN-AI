@@ -1,0 +1,6 @@
+{
+  "name": "GREVIN AI - Institutional Signals & SMC Engine",
+  "description": "Institutional trading signals, market sessions, volume profile POC/VAH/VAL, smart money concepts, and real-time push notifications.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
