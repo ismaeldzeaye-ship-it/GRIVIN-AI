@@ -11,7 +11,7 @@ import kotlin.math.round
 object RiskEngine {
 
     /**
-     * Calculates position lot size dynamically from cTrader symbol specifications.
+     * Calculates position lot size dynamically from verified symbol specifications.
      * If specs (pipValue, lotSize) are unavailable, returns canCalculate = false with an explicit reason.
      */
     fun calculatePositionSize(

@@ -1,34 +1,58 @@
-import { Candle, Timeframe, Tick, CTraderConfig, SymbolInfo } from '../types';
+import { Candle, Timeframe, Tick, MarketDataConfig, SymbolInfo } from '../types';
 
 export function getTimeframeSeconds(tf: Timeframe): number {
   switch (tf) {
     case 'M1': return 60;
     case 'M5': return 300;
+    case '10m': return 600;
     case 'M15': return 900;
+    case '45m': return 2700;
+    case '1H':
     case 'H1': return 3600;
     case 'H4': return 14400;
     case 'D1': return 86400;
+    default: return 900;
   }
 }
 
 /**
- * Default empty cTrader config.
- * Pre-filled client IDs and simulated latency numbers are removed per requirement 1.
+ * Default Market Data Config (Deriv public WS + Binance crypto).
+ * No token, read-only, honest statuses, no simulation shown as live.
  */
-export const INITIAL_CTRADER_CONFIG: CTraderConfig = {
-  clientId: '',
-  clientSecret: '',
-  accessToken: '',
-  accountId: '',
-  environment: 'DEMO',
-  host: 'live.ctraderapi.com',
-  port: 5035,
-  autoReconnect: false,
+export const INITIAL_MARKET_DATA_CONFIG: MarketDataConfig = {
+  deriv: {
+    connected: false,
+    status: 'DISCONNECTED',
+    latencyMs: null,
+    lastHeartbeat: null,
+    isStale: false,
+    lastMessageTime: null,
+    activeSymbolsCount: 0,
+    activeSymbolsLoading: false,
+    activeSymbolsError: null,
+    symbolDebugInfo: {},
+    endpoint: 'wss://api.derivws.com/trading/v1/options/ws/public',
+    errorMessage: null,
+    simulationMode: false
+  },
+  binance: {
+    connected: false,
+    status: 'DISCONNECTED',
+    latencyMs: null,
+    lastUpdate: null,
+    isStale: false,
+    marketType: 'SPOT',
+    activeSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+    restEndpoint: 'https://data-api.binance.vision/api/v3/klines',
+    wsEndpoint: 'wss://stream.binance.com:9443',
+    errorMessage: null,
+    isBlockedRegion: false
+  },
+  simulationMode: false, // OFF by default
   connected: false,
-  simulationMode: false, // OFF by default per requirement 1
-  lastHeartbeat: null,
-  latencyMs: null, // Real measured value or null
-  isStale: false
+  latencyMs: null,
+  isStale: false,
+  allowQuietHoursSignals: true // ON by default
 };
 
 /**
@@ -88,7 +112,7 @@ export function generateSimulatedCandles(
 export const generateCandles = generateSimulatedCandles;
 
 /**
- * Updates live candles from real cTrader tick execution
+ * Updates live candles from broker tick execution
  */
 export function updateCandlesWithTick(
   candles: Candle[],

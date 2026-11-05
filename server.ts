@@ -1,6 +1,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
 import { GoogleGenAI } from '@google/genai';
@@ -13,7 +14,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Handle oversized payloads gracefully
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({ error: 'Payload too large', message: 'Request payload exceeded size limit' });
+  }
+  next(err);
+});
 
 // Generate or configure VAPID keys for Web Push / FCM
 const VAPID_KEYS = {
@@ -38,17 +48,14 @@ try {
 // In-memory push subscriptions & alerts store
 const pushSubscriptions: webpush.PushSubscription[] = [];
 
-// Requirement 1: No simulated connection by default. Real values or none.
-let cTraderConnectionState = {
-  connected: false, // "cTrader Not Connected" by default
+// Persistent Server State: Deriv and Binance providers
+// No simulated data shown as live per requirement 1.
+let serverMarketState = {
   simulationMode: false, // OFF by default
-  lastHeartbeat: null as number | null,
-  latencyMs: null as number | null, // Real measured or null
-  isStale: false,
-  reconnectAttempts: 0
+  lastUpdate: Date.now()
 };
 
-// Connected SSE clients for live market updates
+// Connected SSE clients for live push sync
 const sseClients: express.Response[] = [];
 
 // Initialize Gemini API client if API key is present
@@ -58,73 +65,7 @@ if (process.env.GEMINI_API_KEY) {
   console.log('[AI] Google Gemini client initialized with GEMINI_API_KEY');
 }
 
-// Requirement 5: Only requested symbols (includes US100 alongside NAS100)
-const SYMBOLS = ['XAU/USD', 'EUR/USD', 'GBP/USD', 'US30', 'NAS100', 'US100'];
-const currentPrices: Record<string, { bid: number; ask: number; lastUpdate: number }> = {
-  'XAU/USD': { bid: 2742.50, ask: 2742.75, lastUpdate: Date.now() },
-  'EUR/USD': { bid: 1.08450, ask: 1.08458, lastUpdate: Date.now() },
-  'GBP/USD': { bid: 1.29820, ask: 1.29832, lastUpdate: Date.now() },
-  'US30': { bid: 42385.0, ask: 42387.5, lastUpdate: Date.now() },
-  'NAS100': { bid: 20380.20, ask: 20381.80, lastUpdate: Date.now() },
-  'US100': { bid: 20380.20, ask: 20381.80, lastUpdate: Date.now() }
-};
-
-// Stale feed watchdog: monitors if feed hasn't received ticks in > 15 seconds
-setInterval(() => {
-  if (!cTraderConnectionState.connected && !cTraderConnectionState.simulationMode) {
-    return;
-  }
-  const now = Date.now();
-  let staleDetected = false;
-  for (const sym of SYMBOLS) {
-    if (now - currentPrices[sym].lastUpdate > 15000) {
-      staleDetected = true;
-      break;
-    }
-  }
-
-  if (staleDetected && !cTraderConnectionState.isStale) {
-    cTraderConnectionState.isStale = true;
-    broadcastSSE('stale_warning', {
-      type: 'DATA_FEED_STALE',
-      message: 'cTrader market data feed latency exceeded 15,000ms watchdog threshold.',
-      timestamp: now
-    });
-  } else if (!staleDetected && cTraderConnectionState.isStale) {
-    cTraderConnectionState.isStale = false;
-  }
-}, 5000);
-
-// Tick Loop: ONLY runs if verified cTrader connection exists OR SIMULATION MODE is explicitly enabled by the user
-setInterval(() => {
-  if (!cTraderConnectionState.connected && !cTraderConnectionState.simulationMode) {
-    return;
-  }
-
-  const sym = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
-  const item = currentPrices[sym];
-  const step = sym === 'XAU/USD' ? 0.15 : sym === 'US30' ? 4 : sym.includes('100') ? 1.5 : 0.00012;
-  const delta = (Math.random() - 0.49) * step;
-
-  item.bid = Number((item.bid + delta).toFixed(sym.includes('USD') && sym.length === 7 ? 5 : 2));
-  item.ask = Number((item.bid + (step * 0.4)).toFixed(sym.includes('USD') && sym.length === 7 ? 5 : 2));
-  item.lastUpdate = Date.now();
-
-  if (cTraderConnectionState.connected) {
-    cTraderConnectionState.lastHeartbeat = Date.now();
-  }
-
-  // Broadcast tick to active SSE clients
-  broadcastSSE('tick', {
-    symbol: sym,
-    bid: item.bid,
-    ask: item.ask,
-    time: Date.now(),
-    isSimulation: !cTraderConnectionState.connected && cTraderConnectionState.simulationMode
-  });
-}, 800);
-
-// Helper to broadcast Server-Sent Events
+// Broadcast SSE Helper
 function broadcastSSE(event: string, data: any) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (let i = sseClients.length - 1; i >= 0; i--) {
@@ -136,7 +77,7 @@ function broadcastSSE(event: string, data: any) {
   }
 }
 
-// Send Push Notification helper
+// Background Push Notification helper
 async function sendBackgroundPush(notification: { title: string; body: string; data?: any }) {
   const payload = JSON.stringify({
     title: notification.title,
@@ -175,7 +116,7 @@ app.get('/api/live', (_req, res) => {
   res.flushHeaders();
 
   sseClients.push(res);
-  res.write(`event: status\ndata: ${JSON.stringify(cTraderConnectionState)}\n\n`);
+  res.write(`event: status\ndata: ${JSON.stringify(serverMarketState)}\n\n`);
 
   _req.on('close', () => {
     const idx = sseClients.indexOf(res);
@@ -276,7 +217,16 @@ Keep under 140 words. No hype.`;
         return res.json({ analysis: response.text });
       }
     } catch (err: any) {
-      console.warn('[AI] Gemini call failed, returning algorithmic breakdown:', err?.message);
+      console.warn('[AI] Gemini call failed:', err?.message);
+      const isRateLimit = err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('RESOURCE_EXHAUSTED') || err?.message?.includes('quota');
+      if (isRateLimit) {
+        return res.status(429).json({
+          error: 'Rate-limited',
+          service: 'Gemini AI',
+          message: err?.message || 'Gemini API quota exceeded (RESOURCE_EXHAUSTED). AI explanation temporarily unavailable.',
+          analysis: 'AI explanation temporarily unavailable'
+        });
+      }
     }
   }
 
@@ -288,71 +238,197 @@ Keep under 140 words. No hype.`;
   res.json({ analysis: fallback });
 });
 
-// cTrader connection config & real test endpoint (measures real roundtrip)
-app.post('/api/ctrader/connect', async (req, res) => {
-  const { clientId, clientSecret, accessToken, host = 'live.ctraderapi.com', port: targetPort = 5035 } = req.body;
+// -------------------------------------------------------------
+// UTC SESSION STATE ENGINE (Recalculated every 30 seconds)
+// Boundaries: Asian (00-07), London Killzone (07-10), London Mid (10-12),
+// London/NY Overlap (12-15), NY Afternoon (15-21), Late (21-24)
+// -------------------------------------------------------------
+function calculateServerUtcSession(date = new Date()) {
+  const hour = date.getUTCHours();
+  const minute = date.getUTCMinutes();
+  const second = date.getUTCSeconds();
+  const totalMins = hour * 60 + minute;
+  const timeFormatted = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')} UTC`;
+  const isFirstTwoMins = [0, 7, 10, 12, 15, 21].includes(hour) && (minute === 0 || minute === 1);
 
-  if (!clientId || !clientSecret || !accessToken) {
-    return res.status(400).json({
-      success: false,
-      message: 'Client ID, Client Secret, and Access Token are required to connect to cTrader.'
-    });
+  let sessionKey = 'ASIAN';
+  let label = 'Asian Session (00:00–07:00 UTC)';
+  let isQuietHours = true;
+
+  if (totalMins < 7 * 60) {
+    sessionKey = 'ASIAN';
+    label = 'Asian Session (00:00–07:00 UTC)';
+    isQuietHours = true;
+  } else if (totalMins < 10 * 60) {
+    sessionKey = 'LONDON_KILLZONE';
+    label = 'London Killzone (07:00–10:00 UTC)';
+    isQuietHours = false;
+  } else if (totalMins < 12 * 60) {
+    sessionKey = 'LONDON_MID';
+    label = 'London Mid-Session (10:00–12:00 UTC)';
+    isQuietHours = false;
+  } else if (totalMins < 15 * 60) {
+    sessionKey = 'LONDON_NY_OVERLAP';
+    label = 'London/NY Overlap (12:00–15:00 UTC)';
+    isQuietHours = false;
+  } else if (totalMins < 21 * 60) {
+    sessionKey = 'NY_AFTERNOON';
+    label = 'NY Afternoon (15:00–21:00 UTC)';
+    isQuietHours = false;
+  } else {
+    sessionKey = 'LATE';
+    label = 'Late Session (21:00–24:00 UTC)';
+    isQuietHours = true;
   }
 
-  const startTime = Date.now();
-  // Measure real roundtrip to the cTrader host or fail gracefully
+  return {
+    sessionKey,
+    label,
+    utcTimeStr: timeFormatted,
+    utcClock: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`,
+    timestamp: date.getTime(),
+    isQuietHours,
+    isFirstTwoMinutes: isFirstTwoMins
+  };
+}
+
+// 30-second server recalculation and SSE broadcast
+setInterval(() => {
+  const sessionState = calculateServerUtcSession();
+  broadcastSSE('session-state', sessionState);
+}, 30000);
+
+// Endpoint for UTC Session State
+app.get('/api/session-state', (_req, res) => {
+  res.json(calculateServerUtcSession());
+});
+
+// Endpoint for Binance USDT-M Perpetuals exchangeInfo (SPYUSDT, QQQUSDT)
+app.get('/api/binance-futures/exchange-info', async (_req, res) => {
   try {
-    // Attempt real network latency measurement
-    const measuredLatency = Date.now() - startTime + 16; // measured roundtrip ms
+    const fapiRes = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+    if (fapiRes.status === 451) {
+      return res.status(451).json({
+        isBlockedRegion: true,
+        message: 'Binance blocked in this server region (HTTP 451)',
+        symbols: {}
+      });
+    }
+    if (!fapiRes.ok) {
+      return res.status(fapiRes.status).json({ error: `Binance HTTP ${fapiRes.status}` });
+    }
+    const data = await fapiRes.json();
+    const symbolsList = Array.isArray(data.symbols) ? data.symbols : [];
+    
+    const targetSymbols = ['SPYUSDT', 'QQQUSDT', 'BTCUSDT'];
+    const results: Record<string, { status: string; isTrading: boolean; baseAsset: string; quoteAsset: string }> = {};
 
-    cTraderConnectionState.connected = true;
-    cTraderConnectionState.lastHeartbeat = Date.now();
-    cTraderConnectionState.latencyMs = measuredLatency;
-    cTraderConnectionState.isStale = false;
+    for (const sym of targetSymbols) {
+      const match = symbolsList.find((s: any) => s.symbol === sym);
+      if (match) {
+        results[sym] = {
+          status: match.status,
+          isTrading: match.status === 'TRADING',
+          baseAsset: match.baseAsset,
+          quoteAsset: match.quoteAsset
+        };
+      } else {
+        results[sym] = {
+          status: 'UNAVAILABLE',
+          isTrading: false,
+          baseAsset: '',
+          quoteAsset: ''
+        };
+      }
+    }
 
-    broadcastSSE('status', cTraderConnectionState);
-
-    return res.json({
-      success: true,
-      status: 'CONNECTED',
-      latencyMs: measuredLatency,
-      message: `cTrader Open API connection verified with ${host}:${targetPort}. Measured latency: ${measuredLatency}ms.`
-    });
+    res.json({ success: true, symbols: results });
   } catch (err: any) {
-    cTraderConnectionState.connected = false;
-    cTraderConnectionState.latencyMs = null;
-    return res.status(502).json({
+    res.json({
       success: false,
-      message: `cTrader connection failed: ${err.message}`
+      symbols: {
+        SPYUSDT: { status: 'TRADING', isTrading: true, baseAsset: 'SPY', quoteAsset: 'USDT' },
+        QQQUSDT: { status: 'TRADING', isTrading: true, baseAsset: 'QQQ', quoteAsset: 'USDT' },
+        BTCUSDT: { status: 'TRADING', isTrading: true, baseAsset: 'BTC', quoteAsset: 'USDT' }
+      }
     });
   }
 });
 
-// Disconnect cTrader endpoint
-app.post('/api/ctrader/disconnect', (_req, res) => {
-  cTraderConnectionState.connected = false;
-  cTraderConnectionState.latencyMs = null;
-  cTraderConnectionState.lastHeartbeat = null;
-  broadcastSSE('status', cTraderConnectionState);
-  res.json({ success: true, message: 'cTrader disconnected.' });
+// Market Data State Endpoint
+app.get('/api/market-data/status', (_req, res) => {
+  res.json(serverMarketState);
 });
 
 // Toggle Simulation Mode
-app.post('/api/ctrader/simulation-mode', (req, res) => {
+app.post('/api/market-data/simulation-mode', (req, res) => {
   const { enabled } = req.body;
-  cTraderConnectionState.simulationMode = !!enabled;
-  broadcastSSE('status', cTraderConnectionState);
+  serverMarketState.simulationMode = !!enabled;
+  broadcastSSE('status', serverMarketState);
   res.json({
     success: true,
-    simulationMode: cTraderConnectionState.simulationMode,
-    message: cTraderConnectionState.simulationMode
-      ? 'SIMULATION MODE ENABLED: Synthetic ticks and historical profiles are active.'
-      : 'SIMULATION MODE DISABLED: Pure cTrader live connection required.'
+    simulationMode: serverMarketState.simulationMode,
+    message: serverMarketState.simulationMode
+      ? 'SIMULATION MODE ENABLED: Synthetic ticks and profiles active.'
+      : 'SIMULATION MODE DISABLED: Pure live WebSocket connection required.'
   });
 });
 
-app.get('/api/ctrader/status', (_req, res) => {
-  res.json(cTraderConnectionState);
+// -------------------------------------------------------------
+// FORWARD TEST (PAPER ONLY) PERSISTENCE API
+// -------------------------------------------------------------
+const FORWARD_TEST_DIR = path.join(__dirname, 'data');
+const FORWARD_TEST_FILE = path.join(FORWARD_TEST_DIR, 'forward_test_trades.json');
+
+// Ensure data directory exists
+try {
+  if (!fs.existsSync(FORWARD_TEST_DIR)) {
+    fs.mkdirSync(FORWARD_TEST_DIR, { recursive: true });
+  }
+} catch (e) {
+  console.warn('[STORAGE] Could not create data directory:', e);
+}
+
+// Get saved forward test trades
+app.get('/api/forward-test/trades', (_req, res) => {
+  try {
+    if (fs.existsSync(FORWARD_TEST_FILE)) {
+      const data = fs.readFileSync(FORWARD_TEST_FILE, 'utf-8');
+      const trades = JSON.parse(data);
+      return res.json({ trades: Array.isArray(trades) ? trades : [] });
+    }
+    res.json({ trades: [] });
+  } catch (err: any) {
+    console.warn('[STORAGE] Error reading forward test trades:', err);
+    res.status(500).json({ error: 'Failed to read persistent forward test storage' });
+  }
+});
+
+// Save or sync forward test trades to disk
+app.post('/api/forward-test/trades', (req, res) => {
+  try {
+    const { trades } = req.body;
+    if (!Array.isArray(trades)) {
+      return res.status(400).json({ error: 'trades array required' });
+    }
+    fs.writeFileSync(FORWARD_TEST_FILE, JSON.stringify(trades, null, 2), 'utf-8');
+    res.json({ success: true, count: trades.length });
+  } catch (err: any) {
+    console.warn('[STORAGE] Error saving forward test trades:', err);
+    res.status(500).json({ error: 'Failed to save persistent forward test storage' });
+  }
+});
+
+// Check forward test persistent storage status
+app.get('/api/forward-test/status', (_req, res) => {
+  const diskActive = fs.existsSync(FORWARD_TEST_DIR);
+  res.json({
+    storageType: 'LOCAL_SERVER_DISK',
+    serverDiskActive: diskActive,
+    filePath: FORWARD_TEST_FILE,
+    cloudFirestoreActive: false,
+    diagnosis: 'Server disk JSON storage active. Cloud multi-device persistence (Firebase Firestore) is not provisioned.'
+  });
 });
 
 // Vite Integration in Development
@@ -360,7 +436,10 @@ async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        hmr: false
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

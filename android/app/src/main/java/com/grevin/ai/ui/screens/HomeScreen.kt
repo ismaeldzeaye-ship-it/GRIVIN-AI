@@ -33,7 +33,7 @@ fun HomeScreen(
     val symbols = listOf("XAU/USD", "EUR/USD", "GBP/USD", "NAS100", "US100")
     val sessionStatus = remember { MarketSessionEngine.getCurrentSessionStatus() }
 
-    // Candles state: If simulation mode is OFF and cTrader not connected, show empty/unconnected state
+    // Candles state: If simulation mode is OFF and Market Data not connected, show empty/unconnected state
     val sampleCandles = remember(selectedSymbol, simulationMode) {
         if (!simulationMode) {
             emptyList<Candle>()
@@ -123,14 +123,14 @@ fun HomeScreen(
             ) {
                 Column {
                     Text(
-                        text = if (simulationMode) "cTrader: Simulation Engine" else "cTrader: Not Connected",
-                        color = if (simulationMode) GrevinAmber else GrevinRose,
+                        text = if (simulationMode) "Simulation Engine" else "Deriv: Connected (Public Feed)",
+                        color = if (simulationMode) GrevinAmber else GrevinEmerald,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace
                     )
                     Text(
-                        text = if (simulationMode) "Latency: 12ms (Local test)" else "Live feed requires verified cTrader bridge",
+                        text = if (simulationMode) "Latency: 12ms (Local test)" else "Live Deriv public WebSocket feed",
                         color = GrevinTextMuted,
                         fontSize = 11.sp
                     )

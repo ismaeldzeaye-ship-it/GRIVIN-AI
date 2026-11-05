@@ -201,7 +201,7 @@ object VerificationEngine {
             results.add(TestResult("Strategy 3: Value Area Breakout & BOS", false, "Error: ${e.message}"))
         }
 
-        // 8. Risk Engine: cTrader Dynamic Specs & Safe Fallback
+        // 8. Risk Engine: Verified Dynamic Specs & Safe Fallback
         try {
             val validSymbol = SymbolInfo(
                 symbol = "XAU/USD",
@@ -242,13 +242,13 @@ object VerificationEngine {
 
             results.add(
                 TestResult(
-                    name = "Risk Engine: cTrader Dynamic Specs & Safe Fallback",
+                    name = "Risk Engine: Verified Dynamic Specs & Safe Fallback",
                     passed = passed,
                     message = "Calculation with specs: ${successCalc.recommendedLotSize} lots. Safe fallback message: \"${failCalc.unavailabilityReason}\""
                 )
             )
         } catch (e: Exception) {
-            results.add(TestResult("Risk Engine: cTrader Dynamic Specs & Safe Fallback", false, "Error: ${e.message}"))
+            results.add(TestResult("Risk Engine: Verified Dynamic Specs & Safe Fallback", false, "Error: ${e.message}"))
         }
 
         val allPassed = results.all { it.passed }

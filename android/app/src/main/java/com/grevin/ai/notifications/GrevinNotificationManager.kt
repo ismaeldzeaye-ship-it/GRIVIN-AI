@@ -41,7 +41,7 @@ object GrevinNotificationManager {
                 "System & Connection Alerts",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "cTrader disconnects, stale data warnings, and system status."
+                description = "Market data disconnects, stale data warnings, and system status."
             }
 
             notificationManager.createNotificationChannel(signalChannel)

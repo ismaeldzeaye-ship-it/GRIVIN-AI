@@ -20,6 +20,8 @@ interface SettingsModalProps {
   onChangeTimezone: (tz: string) => void;
   soundEnabled: boolean;
   onToggleSound: () => void;
+  allowQuietHoursSignals?: boolean;
+  onToggleQuietHoursSignals?: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -27,7 +29,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   timezone,
   onChangeTimezone,
   soundEnabled,
-  onToggleSound
+  onToggleSound,
+  allowQuietHoursSignals = true,
+  onToggleQuietHoursSignals
 }) => {
   const [testResults, setTestResults] = useState<{ passed: boolean; results: TestResult[] } | null>(null);
   const [runningTests, setRunningTests] = useState(false);
@@ -47,7 +51,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="flex items-center justify-between border-b border-slate-800 pb-3">
           <div className="flex items-center gap-2">
             <Sliders className="w-4 h-4 text-cyan-400" />
-            <h3 className="text-base font-bold text-slate-100">GREVIN AI System Settings</h3>
+            <h3 className="text-base font-bold text-slate-100">GREVIN AI System Settings &amp; Verification</h3>
           </div>
           <button
             onClick={onClose}
@@ -57,11 +61,66 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
+        {/* Quiet-Hours Signal Switch (Requirement 9) */}
+        <div className="p-4 bg-slate-900/80 rounded-xl border border-cyan-500/30 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <span className="font-bold text-slate-100 text-xs flex items-center gap-2">
+                <Clock className="w-4 h-4 text-cyan-400" />
+                Allow signals in Asian and Late sessions
+              </span>
+              <p className="text-[11px] text-slate-400 max-w-md">
+                ON by default. Allows Strategies 1A, 1B, 1C, 2, and external liquidity sweeps during Asian (00–07 UTC) and Late (21–24 UTC). OFF strictly blocks signals in quiet hours. Respects actual market hours; BTC remains 24/7.
+              </p>
+            </div>
+            <button
+              onClick={onToggleQuietHoursSignals}
+              className={`px-4 py-2 rounded-lg font-bold font-mono text-xs transition border ${
+                allowQuietHoursSignals
+                  ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-lg shadow-cyan-500/20'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+              }`}
+            >
+              {allowQuietHoursSignals ? 'ON (ACTIVE)' : 'OFF (BLOCKED)'}
+            </button>
+          </div>
+        </div>
+
+        {/* Visible Settings Audit Card (Requirement 4) */}
+        <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800 space-y-2.5">
+          <h4 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+            <Sliders className="w-3.5 h-3.5 text-cyan-400" />
+            Configured Institutional Parameters &amp; Rate Caps
+          </h4>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px]">
+            <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800">
+              <span className="text-slate-500 block text-[10px]">MINIMUM STOP</span>
+              <span className="text-rose-400 font-bold text-xs mt-0.5 block">1× ATR(14)</span>
+              <span className="text-[10px] text-slate-400">Structural buffer</span>
+            </div>
+            <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800">
+              <span className="text-slate-500 block text-[10px]">DERIV RATE CAP</span>
+              <span className="text-cyan-400 font-bold text-xs mt-0.5 block">100 req/min</span>
+              <span className="text-[10px] text-slate-400">600ms FIFO delay</span>
+            </div>
+            <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800">
+              <span className="text-slate-500 block text-[10px]">ENTRY VALIDITY</span>
+              <span className="text-amber-400 font-bold text-xs mt-0.5 block">0.25R</span>
+              <span className="text-[10px] text-slate-400">Fill watchdog</span>
+            </div>
+            <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800">
+              <span className="text-slate-500 block text-[10px]">MIN HOLD TIME</span>
+              <span className="text-emerald-400 font-bold text-xs mt-0.5 block">3–4 mins</span>
+              <span className="text-[10px] text-slate-400">Typical 20m–2h</span>
+            </div>
+          </div>
+        </div>
+
         {/* Timezone & Session Definitions */}
         <div className="space-y-3 bg-slate-900/60 p-4 rounded-xl border border-slate-800">
           <h4 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
             <Globe className="w-3.5 h-3.5 text-cyan-400" />
-            Timezone &amp; Market Session Hours
+            Timezone &amp; Institutional UTC Session Windows
           </h4>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -102,12 +161,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          <div className="text-[11px] text-slate-400 bg-slate-950 p-2.5 rounded-lg border border-slate-800 space-y-1">
-            <div className="font-semibold text-slate-300">Standard Institutional Session Windows:</div>
-            <div>• Asian Session: 00:00 - 08:00 UTC (Tokyo/Sydney)</div>
-            <div>• London Session: 07:00 - 15:30 UTC (UK BST) / 08:00 - 16:30 UTC (UK GMT)</div>
-            <div>• New York Session: 12:00 - 20:30 UTC (US EDT) / 13:00 - 21:30 UTC (US EST)</div>
-            <div className="text-cyan-400 font-bold">• Peak Overlap: 12:00 - 15:30 UTC (Maximum Institutional Flow)</div>
+          <div className="text-[11px] text-slate-400 bg-slate-950 p-2.5 rounded-lg border border-slate-800 space-y-1 font-mono">
+            <div className="font-semibold text-slate-300 font-sans">Institutional UTC Session Boundaries (Evaluated every 30s):</div>
+            <div>• Asian Session: 00:00 – 07:00 UTC (Quiet hours; permitted when switch is ON)</div>
+            <div>• London Killzone: 07:00 – 10:00 UTC (Strategy 3 &amp; SMC primary)</div>
+            <div>• London Mid-Session: 10:00 – 12:00 UTC (Strategy 1 &amp; 2)</div>
+            <div className="text-rose-400 font-bold">• London / NY Overlap: 12:00 – 15:00 UTC (Peak institutional volume)</div>
+            <div>• NY Afternoon: 15:00 – 21:00 UTC (US equity continuation)</div>
+            <div>• Late Session: 21:00 – 24:00 UTC (Quiet hours; permitted when switch is ON)</div>
+            <div className="text-amber-400">• Volatility Buffer: First 2 minutes of session open (00, 01) block signals.</div>
+            <div className="text-slate-400 text-[10.5px] pt-1 border-t border-slate-800/80 italic font-sans">Synthetic markets are excluded.</div>
           </div>
         </div>
 

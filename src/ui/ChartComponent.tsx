@@ -1,6 +1,6 @@
 import React, { useRef, useState, useMemo, useEffect } from 'react';
 import { Candle, Timeframe, TradingSignal } from '../types';
-import { calculateVolumeProfile } from '../engine/volumeProfile';
+import { calculateVolumeProfile, calculateTimeAtPriceProfile } from '../engine/volumeProfile';
 import { analyzeMarketStructure } from '../engine/structure';
 import { detectFairValueGaps, detectOrderBlocks } from '../engine/smc';
 import { getActiveSessionSchedules } from '../engine/sessions';
@@ -15,7 +15,9 @@ import {
   ZoomOut, 
   RotateCcw,
   Activity,
-  Crosshair
+  Crosshair,
+  ShieldCheck,
+  X
 } from 'lucide-react';
 
 interface ChartComponentProps {
@@ -23,11 +25,23 @@ interface ChartComponentProps {
   timeframe: Timeframe;
   onTimeframeChange: (tf: Timeframe) => void;
   candles: Candle[];
+  formingCandle?: Candle | null;
   activeSignal?: TradingSignal | null;
+  auditedSignal?: TradingSignal | null;
+  onClearAuditedSignal?: () => void;
   currentBid: number;
   currentAsk: number;
   isConnected: boolean;
   isSimulation: boolean;
+  dataSource?: string;
+  exactBrokerSymbol?: string;
+  volumeType?: 'NONE' | 'APPROXIMATE_TICK' | 'REAL_VOLUME';
+  isStale?: boolean;
+  isMarketOpen?: boolean;
+  binanceMarketType?: 'SPOT' | 'FUTURES';
+  onBinanceMarketTypeChange?: (type: 'SPOT' | 'FUTURES') => void;
+  isBlockedRegion?: boolean;
+  provider?: 'DERIV' | 'BINANCE' | 'SIMULATION';
 }
 
 export const ChartComponent: React.FC<ChartComponentProps> = ({
@@ -35,11 +49,23 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   timeframe,
   onTimeframeChange,
   candles,
+  formingCandle,
   activeSignal,
+  auditedSignal,
+  onClearAuditedSignal,
   currentBid,
   currentAsk,
   isConnected,
-  isSimulation
+  isSimulation,
+  dataSource = 'Deriv',
+  exactBrokerSymbol,
+  volumeType = 'NONE',
+  isStale = false,
+  isMarketOpen = true,
+  binanceMarketType = 'SPOT',
+  onBinanceMarketTypeChange,
+  isBlockedRegion = false,
+  provider = 'DERIV'
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 850, height: 500 });
@@ -76,18 +102,53 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
     return () => window.removeEventListener('resize', updateSize);
   }, []);
 
+  // Combined list of closed candles + real-time forming candle
+  const allCandles = useMemo(() => {
+    if (!formingCandle) return candles;
+    const lastClosed = candles[candles.length - 1];
+    if (!lastClosed || formingCandle.time > lastClosed.time) {
+      return [...candles, formingCandle];
+    } else {
+      // Updates the last forming candle
+      const copy = [...candles];
+      copy[copy.length - 1] = formingCandle;
+      return copy;
+    }
+  }, [candles, formingCandle]);
+
   // Compute sliced visible candles based on pan
   const visibleCandles = useMemo(() => {
-    if (!candles.length) return [];
-    const endIndex = Math.max(0, candles.length - panOffset);
+    if (!allCandles.length) return [];
+    const endIndex = Math.max(0, allCandles.length - panOffset);
     const startIndex = Math.max(0, endIndex - visibleCount);
-    return candles.slice(startIndex, endIndex);
-  }, [candles, visibleCount, panOffset]);
+    return allCandles.slice(startIndex, endIndex);
+  }, [allCandles, visibleCount, panOffset]);
 
-  // Derived Indicators
+  const isBinance = provider === 'BINANCE' || symbol.includes('USDT');
+
+  // Derived Indicators: Real Volume for Binance vs 60-row Time-At-Price for Deriv
   const volumeProfile = useMemo(() => {
-    return calculateVolumeProfile(visibleCandles, symInfo.digits, symInfo.pipSize);
-  }, [visibleCandles, symInfo]);
+    if (!visibleCandles.length) {
+      return {
+        poc: 0,
+        vah: 0,
+        val: 0,
+        totalVolume: 0,
+        valueAreaVolume: 0,
+        levels: [],
+        session: 'LONDON' as any,
+        stepSize: symInfo.pipSize,
+        profileType: (isBinance ? 'REAL_VOLUME' : 'TIME_AT_PRICE') as any,
+        label: isBinance ? 'REAL (Binance trade execution)' : 'APPROXIMATE (time-at-price, no volume)',
+        isApproximateTickVolume: !isBinance
+      };
+    }
+    if (isBinance) {
+      return calculateVolumeProfile(visibleCandles, symInfo.digits, symInfo.pipSize);
+    }
+    // Deriv: 60-row time-at-price profile
+    return calculateTimeAtPriceProfile(visibleCandles, symInfo.digits, symInfo.pipSize);
+  }, [visibleCandles, symInfo, isBinance]);
 
   const structure = useMemo(() => {
     return analyzeMarketStructure(visibleCandles, timeframe);
@@ -110,8 +171,10 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   const chartWidth = Math.max(200, dimensions.width - paddingLeft - paddingRight);
   const chartHeight = Math.max(200, dimensions.height - paddingTop - paddingBottom);
 
+  const hasCandles = visibleCandles.length > 0;
+
   const { minPrice, maxPrice, priceRange } = useMemo(() => {
-    if (!visibleCandles.length) return { minPrice: 0, maxPrice: 100, priceRange: 100 };
+    if (!hasCandles) return { minPrice: 0, maxPrice: 0, priceRange: 0 };
     let min = Infinity;
     let max = -Infinity;
     for (const c of visibleCandles) {
@@ -123,13 +186,13 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
       min = Math.min(min, activeSignal.stopLoss, activeSignal.entryPrice);
       max = Math.max(max, activeSignal.stopLoss, activeSignal.entryPrice, activeSignal.tp);
     }
-    const margin = (max - min) * 0.08 || 1;
+    const margin = (max - min) * 0.08 || (min * 0.001) || 1;
     return {
       minPrice: min - margin,
       maxPrice: max + margin,
       priceRange: (max + margin) - (min - margin)
     };
-  }, [visibleCandles, showEntrySLTP, activeSignal]);
+  }, [visibleCandles, hasCandles, showEntrySLTP, activeSignal]);
 
   const priceToY = (price: number): number => {
     if (priceRange <= 0) return chartHeight / 2 + paddingTop;
@@ -137,6 +200,7 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   };
 
   const yToPrice = (y: number): number => {
+    if (priceRange <= 0) return minPrice;
     const fraction = (chartHeight - (y - paddingTop)) / chartHeight;
     return minPrice + fraction * priceRange;
   };
@@ -148,16 +212,17 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
     return paddingLeft + index * candleSpacing + candleSpacing / 2;
   };
 
-  // Price Grid Lines
+  // Price Grid Lines (Requirement 6: No fake grid ticks when no candles)
   const gridTicks = 6;
   const gridPrices = useMemo(() => {
+    if (!hasCandles || priceRange <= 0) return [];
     const ticks: number[] = [];
     const step = priceRange / gridTicks;
     for (let i = 0; i <= gridTicks; i++) {
       ticks.push(minPrice + i * step);
     }
     return ticks;
-  }, [minPrice, priceRange]);
+  }, [minPrice, priceRange, hasCandles]);
 
   // Session boxes calculation
   const sessionBoxes = useMemo(() => {
@@ -252,10 +317,68 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
               {symInfo.category}
             </span>
+
+            {/* Spot / Futures Selector for Binance */}
+            {provider === 'BINANCE' && onBinanceMarketTypeChange && (
+              <div className="flex items-center bg-slate-900 border border-slate-700/80 rounded-md p-0.5 text-[10px] font-mono">
+                <button
+                  type="button"
+                  onClick={() => onBinanceMarketTypeChange('SPOT')}
+                  className={`px-2 py-0.5 rounded transition font-bold ${
+                    binanceMarketType === 'SPOT'
+                      ? 'bg-amber-400 text-slate-950 shadow'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Binance Spot Market (https://data-api.binance.vision)"
+                >
+                  SPOT
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onBinanceMarketTypeChange('FUTURES')}
+                  className={`px-2 py-0.5 rounded transition font-bold ${
+                    binanceMarketType === 'FUTURES'
+                      ? 'bg-cyan-400 text-slate-950 shadow'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Binance USDT-M Perpetuals (https://fapi.binance.com)"
+                >
+                  FUTURES
+                </button>
+              </div>
+            )}
+
+            {/* Exact symbol, market type & REAL Volume badge */}
+            {provider === 'BINANCE' && (
+              <span 
+                className="hidden lg:inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-300 border border-emerald-500/30"
+                title="USDT is a USD-pegged stablecoin, not fiat USD. Real exchange trade volume."
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                {binanceMarketType} • {exactBrokerSymbol || symbol.replace('/', '')} • REAL VOL
+              </span>
+            )}
+
+            {/* Perpetual proxy label for SPY/QQQ */}
+            {(symbol === 'SPYUSDT' || symbol === 'QQQUSDT' || exactBrokerSymbol?.includes('SPY') || exactBrokerSymbol?.includes('QQQ')) && (
+              <span 
+                className="hidden xl:inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded bg-purple-950/70 text-purple-300 border border-purple-500/30 font-bold"
+                title="Binance USDT-M Perpetual contract proxy — Not an index or CME futures"
+              >
+                PERPETUAL (PROXY)
+              </span>
+            )}
+
+            {!isMarketOpen && (
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-500/30 font-bold flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                MARKET CLOSED
+              </span>
+            )}
           </div>
 
           <div className="flex items-center bg-[#070a12] p-0.5 rounded-lg border border-slate-800 text-xs font-semibold">
-            {(['M1', 'M5', 'M15', 'H1', 'H4', 'D1'] as Timeframe[]).map((tf) => (
+            {(['10m', '45m', '1H', 'M5', 'M15', 'H4', 'D1'] as Timeframe[]).map((tf) => (
               <button
                 key={tf}
                 onClick={() => onTimeframeChange(tf)}
@@ -414,6 +537,50 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
           )}
         </div>
       </div>
+
+      {/* Visual Signal Audit Banner (Requirement 3) */}
+      {auditedSignal && (
+        <div className="bg-cyan-950/90 border border-cyan-500/40 p-3 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs font-mono shadow-lg">
+          <div className="flex items-center gap-2.5">
+            <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0" />
+            <div>
+              <span className="font-bold text-cyan-300 mr-2">AUDIT VISUALIZATION:</span>
+              <span className="text-slate-100 font-bold">{auditedSignal.symbol} • {auditedSignal.strategyName}</span>
+              <span className="text-amber-300 ml-2 font-bold">[Grade {auditedSignal.grade}]</span>
+            </div>
+            {auditedSignal.auditLevels && (
+              <div className="hidden md:flex items-center gap-2 text-[11px] text-slate-300 ml-3">
+                <span className="text-amber-400">POC: {formatPrice(auditedSignal.auditLevels.poc, auditedSignal.symbol)}</span>
+                <span>|</span>
+                <span className="text-cyan-400">VAH: {formatPrice(auditedSignal.auditLevels.vah, auditedSignal.symbol)}</span>
+                <span>|</span>
+                <span className="text-cyan-400">VAL: {formatPrice(auditedSignal.auditLevels.val, auditedSignal.symbol)}</span>
+                {auditedSignal.auditLevels.bosPrice && (
+                  <>
+                    <span>|</span>
+                    <span className="text-purple-400">BOS: {formatPrice(auditedSignal.auditLevels.bosPrice, auditedSignal.symbol)}</span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-700">
+              {auditedSignal.auditLevels?.profileLabel || (isBinance ? 'REAL (Binance trade execution)' : 'APPROXIMATE (time-at-price, no volume)')}
+            </span>
+            {onClearAuditedSignal && (
+              <button
+                onClick={onClearAuditedSignal}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition border border-slate-600"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Exit Audit</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Main Chart Canvas / SVG Container */}
       <div 
@@ -681,38 +848,363 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             />
           )}
 
-          {/* Active Signal: ENTRY, SL, TP LINES with RIGHT-EDGE LABELS */}
-          {showEntrySLTP && activeSignal && (
-            <g>
-              {/* Entry Line */}
+          {/* Item 13: Entry, Stop, and TP1 Boxes spanning from signal candle to invalidation or expiry */}
+          {showEntrySLTP && (auditedSignal || activeSignal) && (() => {
+            const targetSignal = auditedSignal || activeSignal;
+            if (!targetSignal) return null;
+
+            // Determine signal candle X coordinate
+            const signalTimeSec = targetSignal.signalCandleTime
+              ? (targetSignal.signalCandleTime > 1e11 ? Math.floor(targetSignal.signalCandleTime / 1000) : targetSignal.signalCandleTime)
+              : (targetSignal.timestamp ? Math.floor(targetSignal.timestamp / 1000) : null);
+
+            let signalIdx = -1;
+            if (signalTimeSec && visibleCandles.length > 0) {
+              for (let i = 0; i < visibleCandles.length; i++) {
+                const c = visibleCandles[i];
+                const nextTime = i < visibleCandles.length - 1 ? visibleCandles[i + 1].time : c.time + 3600;
+                if (signalTimeSec >= c.time && signalTimeSec < nextTime) {
+                  signalIdx = i;
+                  break;
+                }
+              }
+              if (signalIdx === -1) {
+                let minDiff = Infinity;
+                visibleCandles.forEach((c, idx) => {
+                  const d = Math.abs(c.time - signalTimeSec);
+                  if (d < minDiff) {
+                    minDiff = d;
+                    signalIdx = idx;
+                  }
+                });
+              }
+            }
+            if (signalIdx === -1) {
+              signalIdx = Math.max(0, visibleCandles.length - 15);
+            }
+
+            const xStart = candleToX(signalIdx);
+
+            // Determine expiry X coordinate
+            let expiryIdx = -1;
+            if (targetSignal.validUntilEpoch) {
+              const expirySec = Math.floor(targetSignal.validUntilEpoch / 1000);
+              for (let i = signalIdx; i < visibleCandles.length; i++) {
+                if (visibleCandles[i].time >= expirySec) {
+                  expiryIdx = i;
+                  break;
+                }
+              }
+            }
+
+            const xEnd = (expiryIdx !== -1 && expiryIdx > signalIdx)
+              ? candleToX(expiryIdx)
+              : (paddingLeft + chartWidth);
+
+            const boxWidth = Math.max(90, xEnd - xStart);
+
+            const yEntry = priceToY(targetSignal.entryPrice);
+            const ySL = priceToY(targetSignal.stopLoss);
+            const yTP1 = priceToY(targetSignal.tp);
+
+            // TP1 Box spans between yEntry and yTP1
+            const tpBoxY = Math.min(yEntry, yTP1);
+            const tpBoxH = Math.max(6, Math.abs(yTP1 - yEntry));
+
+            // SL Box spans between yEntry and ySL
+            const slBoxY = Math.min(yEntry, ySL);
+            const slBoxH = Math.max(6, Math.abs(ySL - yEntry));
+
+            const isBuy = targetSignal.direction === 'BUY';
+
+            return (
+              <g key="signal-target-boxes">
+                {/* Full-width dashed reference guidelines */}
+                <line
+                  x1={paddingLeft}
+                  y1={yEntry}
+                  x2={paddingLeft + chartWidth}
+                  y2={yEntry}
+                  stroke="#06b6d4"
+                  strokeWidth="1"
+                  strokeDasharray="2 4"
+                  opacity="0.6"
+                />
+                <line
+                  x1={paddingLeft}
+                  y1={ySL}
+                  x2={paddingLeft + chartWidth}
+                  y2={ySL}
+                  stroke="#ef4444"
+                  strokeWidth="1"
+                  strokeDasharray="2 4"
+                  opacity="0.6"
+                />
+                <line
+                  x1={paddingLeft}
+                  y1={yTP1}
+                  x2={paddingLeft + chartWidth}
+                  y2={yTP1}
+                  stroke="#10b981"
+                  strokeWidth="1"
+                  strokeDasharray="2 4"
+                  opacity="0.6"
+                />
+
+                {/* TP1 Projection Box (Green) */}
+                <rect
+                  x={xStart}
+                  y={tpBoxY}
+                  width={boxWidth}
+                  height={tpBoxH}
+                  fill="rgba(16, 185, 129, 0.14)"
+                  stroke="#10b981"
+                  strokeWidth="1.5"
+                  strokeDasharray="4 2"
+                  rx="3"
+                />
+                <text
+                  x={xStart + 8}
+                  y={isBuy ? tpBoxY + 14 : tpBoxY + tpBoxH - 8}
+                  fill="#10b981"
+                  fontSize="10"
+                  fontWeight="bold"
+                  fontFamily="monospace"
+                >
+                  TP1: {formatPrice(targetSignal.tp, targetSignal.symbol)} (+{targetSignal.tp1DistanceFormatted || targetSignal.rewardPips + 'p'}) • {targetSignal.tp1OverRRatio || 'TP1 / R = 2.00 OK'}
+                </text>
+
+                {/* SL Projection Box (Red) */}
+                <rect
+                  x={xStart}
+                  y={slBoxY}
+                  width={boxWidth}
+                  height={slBoxH}
+                  fill="rgba(239, 68, 68, 0.14)"
+                  stroke="#ef4444"
+                  strokeWidth="1.5"
+                  strokeDasharray="4 2"
+                  rx="3"
+                />
+                <text
+                  x={xStart + 8}
+                  y={isBuy ? slBoxY + slBoxH - 8 : slBoxY + 14}
+                  fill="#ef4444"
+                  fontSize="10"
+                  fontWeight="bold"
+                  fontFamily="monospace"
+                >
+                  SL: {formatPrice(targetSignal.stopLoss, targetSignal.symbol)} (-{targetSignal.stopDistanceFormatted || targetSignal.riskPips + 'p'}) [1x ATR14]
+                </text>
+
+                {/* Entry Center Line & Label */}
+                <line
+                  x1={xStart}
+                  y1={yEntry}
+                  x2={xStart + boxWidth}
+                  y2={yEntry}
+                  stroke="#06b6d4"
+                  strokeWidth="2.5"
+                />
+                <text
+                  x={xStart + 8}
+                  y={yEntry - 5}
+                  fill="#06b6d4"
+                  fontSize="10.5"
+                  fontWeight="800"
+                  fontFamily="monospace"
+                >
+                  ENTRY: {formatPrice(targetSignal.entryPrice, targetSignal.symbol)} • R = {targetSignal.stopDistanceFormatted || targetSignal.riskPips + 'p'}
+                </text>
+
+                {/* Valid Until / Expiry Box Label */}
+                <rect
+                  x={xStart}
+                  y={Math.max(paddingTop + 2, Math.min(tpBoxY, slBoxY) - 18)}
+                  width={Math.min(boxWidth, 240)}
+                  height="16"
+                  rx="3"
+                  fill="#090d16"
+                  stroke="#38bdf8"
+                  strokeWidth="1"
+                />
+                <text
+                  x={xStart + 6}
+                  y={Math.max(paddingTop + 2, Math.min(tpBoxY, slBoxY) - 18) + 11}
+                  fill="#38bdf8"
+                  fontSize="9"
+                  fontWeight="bold"
+                  fontFamily="monospace"
+                >
+                  VALID UNTIL: {targetSignal.validUntilTimeUtc || 'Active Session'}
+                </text>
+              </g>
+            );
+          })()}
+
+          {/* AUDITED SIGNAL EXACT LEVELS (POC, VAH, VAL, SWINGS, BOS CANDLE TIME) */}
+          {auditedSignal && auditedSignal.auditLevels && (
+            <g key="audited-signal-levels">
+              {/* Audited POC Line */}
               <line
                 x1={paddingLeft}
-                y1={priceToY(activeSignal.entryPrice)}
+                y1={priceToY(auditedSignal.auditLevels.poc)}
                 x2={paddingLeft + chartWidth}
-                y2={priceToY(activeSignal.entryPrice)}
-                stroke="#06b6d4"
-                strokeWidth="1.8"
+                y2={priceToY(auditedSignal.auditLevels.poc)}
+                stroke="#f59e0b"
+                strokeWidth="2.5"
+                strokeDasharray="6 3"
               />
-              {/* Stop Loss Line */}
+              <text
+                x={paddingLeft + 10}
+                y={priceToY(auditedSignal.auditLevels.poc) - 5}
+                fill="#f59e0b"
+                fontSize="10"
+                fontWeight="bold"
+                letterSpacing="0.5"
+              >
+                AUDIT POC: {formatPrice(auditedSignal.auditLevels.poc, auditedSignal.symbol)} ({auditedSignal.auditLevels.profileLabel})
+              </text>
+
+              {/* Audited VAH Line */}
               <line
                 x1={paddingLeft}
-                y1={priceToY(activeSignal.stopLoss)}
+                y1={priceToY(auditedSignal.auditLevels.vah)}
                 x2={paddingLeft + chartWidth}
-                y2={priceToY(activeSignal.stopLoss)}
-                stroke="#ef4444"
-                strokeWidth="1.8"
-                strokeDasharray="4 2"
+                y2={priceToY(auditedSignal.auditLevels.vah)}
+                stroke="#38bdf8"
+                strokeWidth="2"
+                strokeDasharray="4 3"
               />
-              {/* Single Take Profit (2R) Line */}
+              <text
+                x={paddingLeft + 10}
+                y={priceToY(auditedSignal.auditLevels.vah) - 5}
+                fill="#38bdf8"
+                fontSize="10"
+                fontWeight="bold"
+              >
+                AUDIT VAH: {formatPrice(auditedSignal.auditLevels.vah, auditedSignal.symbol)}
+              </text>
+
+              {/* Audited VAL Line */}
               <line
                 x1={paddingLeft}
-                y1={priceToY(activeSignal.tp)}
+                y1={priceToY(auditedSignal.auditLevels.val)}
                 x2={paddingLeft + chartWidth}
-                y2={priceToY(activeSignal.tp)}
-                stroke="#10b981"
-                strokeWidth="1.8"
-                strokeDasharray="4 2"
+                y2={priceToY(auditedSignal.auditLevels.val)}
+                stroke="#38bdf8"
+                strokeWidth="2"
+                strokeDasharray="4 3"
               />
+              <text
+                x={paddingLeft + 10}
+                y={priceToY(auditedSignal.auditLevels.val) + 14}
+                fill="#38bdf8"
+                fontSize="10"
+                fontWeight="bold"
+              >
+                AUDIT VAL: {formatPrice(auditedSignal.auditLevels.val, auditedSignal.symbol)}
+              </text>
+
+              {/* Audited Swing High */}
+              {auditedSignal.auditLevels.swingHigh && (
+                <g>
+                  <line
+                    x1={paddingLeft}
+                    y1={priceToY(auditedSignal.auditLevels.swingHigh)}
+                    x2={paddingLeft + chartWidth}
+                    y2={priceToY(auditedSignal.auditLevels.swingHigh)}
+                    stroke="#c084fc"
+                    strokeWidth="1.5"
+                    strokeDasharray="3 3"
+                  />
+                  <text
+                    x={paddingLeft + chartWidth - 140}
+                    y={priceToY(auditedSignal.auditLevels.swingHigh) - 4}
+                    fill="#c084fc"
+                    fontSize="9.5"
+                    fontWeight="bold"
+                  >
+                    SWING HIGH: {formatPrice(auditedSignal.auditLevels.swingHigh, auditedSignal.symbol)}
+                  </text>
+                </g>
+              )}
+
+              {/* Audited Swing Low */}
+              {auditedSignal.auditLevels.swingLow && (
+                <g>
+                  <line
+                    x1={paddingLeft}
+                    y1={priceToY(auditedSignal.auditLevels.swingLow)}
+                    x2={paddingLeft + chartWidth}
+                    y2={priceToY(auditedSignal.auditLevels.swingLow)}
+                    stroke="#c084fc"
+                    strokeWidth="1.5"
+                    strokeDasharray="3 3"
+                  />
+                  <text
+                    x={paddingLeft + chartWidth - 140}
+                    y={priceToY(auditedSignal.auditLevels.swingLow) + 13}
+                    fill="#c084fc"
+                    fontSize="9.5"
+                    fontWeight="bold"
+                  >
+                    SWING LOW: {formatPrice(auditedSignal.auditLevels.swingLow, auditedSignal.symbol)}
+                  </text>
+                </g>
+              )}
+
+              {/* BOS Candle Time Marker */}
+              {(() => {
+                if (!auditedSignal.auditLevels.bosCandleTime) return null;
+                const bosTime = auditedSignal.auditLevels.bosCandleTime;
+                let closestIdx = -1;
+                let minDiff = Infinity;
+                visibleCandles.forEach((c, idx) => {
+                  const diff = Math.abs(c.time - bosTime);
+                  if (diff < minDiff) {
+                    minDiff = diff;
+                    closestIdx = idx;
+                  }
+                });
+                if (closestIdx >= 0) {
+                  const x = candleToX(closestIdx);
+                  return (
+                    <g key="audit-bos-marker">
+                      <line
+                        x1={x}
+                        y1={paddingTop}
+                        x2={x}
+                        y2={paddingTop + chartHeight}
+                        stroke="#eab308"
+                        strokeWidth="2"
+                        strokeDasharray="4 2"
+                      />
+                      <rect
+                        x={x - 45}
+                        y={paddingTop + 5}
+                        width="90"
+                        height="18"
+                        rx="3"
+                        fill="#090d16"
+                        stroke="#eab308"
+                        strokeWidth="1.5"
+                      />
+                      <text
+                        x={x}
+                        y={paddingTop + 17}
+                        fill="#eab308"
+                        fontSize="9"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                      >
+                        BOS CONFIRMED
+                      </text>
+                    </g>
+                  );
+                }
+                return null;
+              })()}
             </g>
           )}
 
@@ -739,113 +1231,203 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
               />
             </g>
           )}
+
+          {/* Empty Chart Canvas State (Requirement 6: When there are no candles, show "No data" instead of a fake axis) */}
+          {!hasCandles && (
+            <g>
+              <rect
+                x={paddingLeft}
+                y={paddingTop}
+                width={chartWidth}
+                height={chartHeight}
+                fill="#070a12"
+                fillOpacity="0.4"
+              />
+              <text
+                x={paddingLeft + chartWidth / 2}
+                y={paddingTop + chartHeight / 2 - 10}
+                fill="#64748b"
+                fontSize="14"
+                fontWeight="bold"
+                textAnchor="middle"
+                fontFamily="monospace"
+              >
+                No candle data available
+              </text>
+              <text
+                x={paddingLeft + chartWidth / 2}
+                y={paddingTop + chartHeight / 2 + 14}
+                fill="#475569"
+                fontSize="11"
+                textAnchor="middle"
+                fontFamily="monospace"
+              >
+                {!isMarketOpen
+                  ? 'MARKET CLOSED — Awaiting closed session history from Deriv'
+                  : 'Connecting to market data feed...'}
+              </text>
+            </g>
+          )}
         </svg>
 
         {/* RIGHT EDGE PRICE SCALE & LABELS (MANDATORY REQUIREMENT) */}
         <div 
-          className="absolute right-0 top-0 bottom-0 bg-[#070b14] border-l border-slate-800 flex flex-col justify-between font-mono select-none"
+          className="absolute right-0 top-0 bottom-0 bg-[#070b14] border-l border-slate-800 flex flex-col font-mono select-none"
           style={{ width: `${paddingRight}px` }}
         >
-          {/* Grid Level Price Tags */}
-          {gridPrices.map((p, idx) => {
-            const y = priceToY(p);
-            return (
-              <div
-                key={`scale-${idx}`}
-                className="absolute text-[11px] text-slate-400 font-mono pl-2"
-                style={{ top: `${y - 8}px` }}
-              >
-                {formatPrice(p, symbol)}
-              </div>
-            );
-          })}
-
-          {/* Volume Profile POC/VAH/VAL Right Edge Badges */}
-          {showVolumeProfile && (
-            <>
-              <div
-                className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-950 text-red-300 border border-red-500/50 shadow"
-                style={{ top: `${priceToY(volumeProfile.poc) - 10}px` }}
-              >
-                POC {formatPrice(volumeProfile.poc, symbol)}
-              </div>
-              <div
-                className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-sky-950 text-sky-300 border border-sky-500/40"
-                style={{ top: `${priceToY(volumeProfile.vah) - 9}px` }}
-              >
-                VAH {formatPrice(volumeProfile.vah, symbol)}
-              </div>
-              <div
-                className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-sky-950 text-sky-300 border border-sky-500/40"
-                style={{ top: `${priceToY(volumeProfile.val) - 9}px` }}
-              >
-                VAL {formatPrice(volumeProfile.val, symbol)}
-              </div>
-            </>
-          )}
-
-          {/* Current Live Price Right Edge Pill */}
-          <div
-            className="absolute left-0 right-0 z-20 px-2 py-1 text-[11px] font-black text-slate-950 bg-cyan-400 shadow-lg flex items-center justify-between"
-            style={{ top: `${priceToY(currentBid) - 12}px` }}
-          >
-            <span>LIVE</span>
-            <span>{formatPrice(currentBid, symbol)}</span>
-          </div>
-
-          {/* ENTRY / SL / TP LABELS SITTING AT THE RIGHT EDGE */}
-          {showEntrySLTP && activeSignal && (
-            <>
-              {/* ENTRY LABEL */}
-              <div
-                className="absolute left-0 z-30 px-1.5 py-1 text-[10.5px] font-bold text-cyan-200 bg-cyan-950/95 border-l-2 border-cyan-400 border-y border-r border-cyan-800/80 rounded-r shadow-md flex items-center justify-between w-full"
-                style={{ top: `${priceToY(activeSignal.entryPrice) - 11}px` }}
-              >
-                <span className="text-[9px] uppercase font-mono tracking-wider">ENTRY</span>
-                <span>{formatPrice(activeSignal.entryPrice, symbol)}</span>
-              </div>
-
-              {/* STOP LOSS LABEL */}
-              <div
-                className="absolute left-0 z-30 px-1.5 py-1 text-[10.5px] font-bold text-rose-200 bg-rose-950/95 border-l-2 border-rose-500 border-y border-r border-rose-800/80 rounded-r shadow-md flex items-center justify-between w-full"
-                style={{ top: `${priceToY(activeSignal.stopLoss) - 11}px` }}
-              >
-                <span className="text-[9px] uppercase font-mono tracking-wider text-rose-400">SL</span>
-                <span>{formatPrice(activeSignal.stopLoss, symbol)}</span>
-              </div>
-
-              {/* SINGLE TAKE PROFIT LABEL (2R) */}
-              <div
-                className="absolute left-0 z-30 px-1.5 py-1 text-[10px] font-bold text-emerald-200 bg-emerald-950/95 border-l-2 border-emerald-400 border-y border-r border-emerald-800/80 rounded-r shadow-md flex items-center justify-between w-full"
-                style={{ top: `${priceToY(activeSignal.tp) - 10}px` }}
-              >
-                <span className="text-[9px] uppercase font-mono tracking-wider text-emerald-300">TP (2R)</span>
-                <span>{formatPrice(activeSignal.tp, symbol)}</span>
-              </div>
-            </>
-          )}
-
-          {/* Mouse Crosshair Price Tag */}
-          {showCrosshair && mousePos && (
-            <div
-              className="absolute left-0 right-0 z-40 px-2 py-0.5 text-[10.5px] font-mono text-slate-100 bg-slate-800 border-l-2 border-cyan-400 shadow"
-              style={{ top: `${mousePos.y - 10}px` }}
-            >
-              {formatPrice(yToPrice(mousePos.y), symbol)}
+          {!hasCandles ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-2 text-center">
+              <span className="text-[11px] font-mono text-slate-500 font-bold uppercase tracking-wider">
+                No data
+              </span>
             </div>
+          ) : (
+            <>
+              {/* Grid Level Price Tags */}
+              {gridPrices.map((p, idx) => {
+                const y = priceToY(p);
+                return (
+                  <div
+                    key={`scale-${idx}`}
+                    className="absolute text-[11px] text-slate-400 font-mono pl-2"
+                    style={{ top: `${y - 8}px` }}
+                  >
+                    {formatPrice(p, symbol)}
+                  </div>
+                );
+              })}
+
+              {/* Volume Profile POC/VAH/VAL Right Edge Badges */}
+              {showVolumeProfile && (
+                <>
+                  <div
+                    className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-950 text-red-300 border border-red-500/50 shadow"
+                    style={{ top: `${priceToY(volumeProfile.poc) - 10}px` }}
+                  >
+                    POC {formatPrice(volumeProfile.poc, symbol)}
+                  </div>
+                  <div
+                    className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-sky-950 text-sky-300 border border-sky-500/40"
+                    style={{ top: `${priceToY(volumeProfile.vah) - 9}px` }}
+                  >
+                    VAH {formatPrice(volumeProfile.vah, symbol)}
+                  </div>
+                  <div
+                    className="absolute left-1 z-10 px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-sky-950 text-sky-300 border border-sky-500/40"
+                    style={{ top: `${priceToY(volumeProfile.val) - 9}px` }}
+                  >
+                    VAL {formatPrice(volumeProfile.val, symbol)}
+                  </div>
+                </>
+              )}
+
+              {/* Current Live Price Right Edge Pill */}
+              <div
+                className={`absolute left-0 right-0 z-20 px-2 py-1 text-[11px] font-black shadow-lg flex items-center justify-between ${
+                  !isMarketOpen ? 'bg-slate-700 text-slate-200' : 'bg-cyan-400 text-slate-950'
+                }`}
+                style={{ top: `${priceToY(currentBid) - 12}px` }}
+              >
+                <span>{isMarketOpen ? 'LIVE' : 'CLOSED'}</span>
+                <span>{formatPrice(currentBid, symbol)}</span>
+              </div>
+
+              {/* ENTRY / SL / TP LABELS SITTING AT THE RIGHT EDGE */}
+              {showEntrySLTP && (auditedSignal || activeSignal) && (() => {
+                const targetSignal = auditedSignal || activeSignal;
+                if (!targetSignal) return null;
+                return (
+                  <>
+                    {/* ENTRY LABEL */}
+                    <div
+                      className="absolute left-0 z-30 px-1.5 py-1 text-[10.5px] font-bold text-cyan-200 bg-cyan-950/95 border-l-2 border-cyan-400 border-y border-r border-cyan-800/80 rounded-r shadow-md flex items-center justify-between w-full"
+                      style={{ top: `${priceToY(targetSignal.entryPrice) - 11}px` }}
+                    >
+                      <span className="text-[9px] uppercase font-mono tracking-wider">ENTRY</span>
+                      <span>{formatPrice(targetSignal.entryPrice, symbol)}</span>
+                    </div>
+
+                    {/* STOP LOSS LABEL */}
+                    <div
+                      className="absolute left-0 z-30 px-1.5 py-1 text-[10.5px] font-bold text-rose-200 bg-rose-950/95 border-l-2 border-rose-500 border-y border-r border-rose-800/80 rounded-r shadow-md flex items-center justify-between w-full"
+                      style={{ top: `${priceToY(targetSignal.stopLoss) - 11}px` }}
+                    >
+                      <span className="text-[9px] uppercase font-mono tracking-wider text-rose-400">SL</span>
+                      <span>{formatPrice(targetSignal.stopLoss, symbol)}</span>
+                    </div>
+
+                    {/* SINGLE TAKE PROFIT LABEL (2R) */}
+                    <div
+                      className="absolute left-0 z-30 px-1.5 py-1 text-[10px] font-bold text-emerald-200 bg-emerald-950/95 border-l-2 border-emerald-400 border-y border-r border-emerald-800/80 rounded-r shadow-md flex items-center justify-between w-full"
+                      style={{ top: `${priceToY(targetSignal.tp) - 10}px` }}
+                    >
+                      <span className="text-[9px] uppercase font-mono tracking-wider text-emerald-300">TP (2R)</span>
+                      <span>{formatPrice(targetSignal.tp, symbol)}</span>
+                    </div>
+                  </>
+                );
+              })()}
+
+              {/* Mouse Crosshair Price Tag */}
+              {showCrosshair && mousePos && (
+                <div
+                  className="absolute left-0 right-0 z-40 px-2 py-0.5 text-[10.5px] font-mono text-slate-100 bg-slate-800 border-l-2 border-cyan-400 shadow"
+                  style={{ top: `${mousePos.y - 10}px` }}
+                >
+                  {formatPrice(yToPrice(mousePos.y), symbol)}
+                </div>
+              )}
+            </>
           )}
         </div>
 
-        {/* Disconnected Overlay (Requirement 1) */}
-        {!isConnected && !isSimulation && (
+        {/* Disconnected Overlay */}
+        {!isConnected && !isSimulation && !isBlockedRegion && (
           <div className="absolute inset-0 z-30 bg-[#090d16]/90 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
             <div className="p-3 rounded-full bg-slate-900 border border-slate-800 text-slate-500 mb-2">
               <Activity className="w-6 h-6 text-rose-400" />
             </div>
-            <h3 className="text-sm font-bold text-slate-200">cTrader Not Connected</h3>
+            <h3 className="text-sm font-bold text-slate-200">Market Data Not Connected</h3>
             <p className="text-xs text-slate-400 max-w-sm mt-1">
-              Live chart feed and institutional signals require a verified cTrader connection. Configure credentials in Market Data or toggle Simulation Mode to inspect setups.
+              Live chart feed and institutional signals require an active connection to Deriv WebSocket or Binance. Open Market Data or toggle Simulation Mode to inspect setups.
             </p>
+          </div>
+        )}
+
+        {/* Binance HTTP 451 Regional Block Overlay (Requirement 7) */}
+        {isBlockedRegion && (
+          <div className="absolute inset-0 z-35 bg-[#090d16]/95 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
+            <div className="p-3 rounded-full bg-rose-950/80 border border-rose-500/50 text-rose-400 mb-2">
+              <Activity className="w-6 h-6 text-rose-400" />
+            </div>
+            <h3 className="text-sm font-bold text-rose-300 font-mono">Binance blocked in this server region</h3>
+            <p className="text-xs text-slate-400 max-w-md mt-1">
+              Binance returned HTTP 451 (regional block). No simulated data is substituted to prevent inaccurate signal generation.
+            </p>
+          </div>
+        )}
+
+        {/* Profile specification badge: Binance Real Volume vs Deriv Time-At-Price */}
+        {showVolumeProfile && (
+          <div className="absolute top-12 left-4 z-20 flex items-center gap-1.5 bg-slate-950/90 border border-slate-700 text-slate-300 text-xs px-3 py-1.5 rounded-lg shadow-lg font-mono">
+            <span className={`w-2 h-2 rounded-full ${isBinance ? 'bg-emerald-400' : 'bg-cyan-400'}`}></span>
+            <span>Profile: {volumeProfile.label}</span>
+          </div>
+        )}
+
+        {/* Data Feed Stale Warning Badge (Requirement 7 & Fix 2: Open markets only) */}
+        {isStale && isMarketOpen && (
+          <div className="absolute top-2 right-4 z-20 flex items-center gap-1.5 bg-rose-950/90 border border-rose-500/50 text-rose-300 text-xs px-3 py-1.5 rounded-lg shadow-xl font-mono animate-pulse">
+            <span className="w-2 h-2 rounded-full bg-rose-500"></span>
+            <span>FEED STALE (&gt;15s) — SIGNALS BLOCKED</span>
+          </div>
+        )}
+
+        {/* Market Closed Badge (Requirement 2) */}
+        {!isMarketOpen && (
+          <div className="absolute top-2 right-4 z-20 flex items-center gap-1.5 bg-slate-950/90 border border-amber-500/40 text-amber-300 text-xs px-3 py-1.5 rounded-lg shadow-lg font-mono">
+            <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+            <span>MARKET CLOSED</span>
           </div>
         )}
 
@@ -859,19 +1441,58 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             <span>H: <strong className="text-emerald-400">{formatPrice(hoveredCandle.high, symbol)}</strong></span>
             <span>L: <strong className="text-rose-400">{formatPrice(hoveredCandle.low, symbol)}</strong></span>
             <span>C: <strong className="text-slate-100">{formatPrice(hoveredCandle.close, symbol)}</strong></span>
-            <span className="text-slate-400">Vol: <strong>{hoveredCandle.volume.toLocaleString()}</strong></span>
+            <span className="text-slate-400">
+              Vol: <strong>{hoveredCandle.volume ? hoveredCandle.volume.toLocaleString() : 'NONE'}</strong>
+            </span>
+            {hoveredCandle.isOffHours && (
+              <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30 text-[10px]">
+                OFF-HOURS
+              </span>
+            )}
+            {hoveredCandle.isForming && (
+              <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/30 text-[10px]">
+                FORMING
+              </span>
+            )}
           </div>
         )}
       </div>
 
-      {/* Bottom Chart Footer: Status & Time Coordinates */}
-      <div className="flex items-center justify-between px-4 py-1.5 bg-[#070b14] border-t border-slate-800 text-[11px] text-slate-400 font-mono">
-        <div className="flex items-center gap-4">
+      {/* Bottom Chart Footer: Data Source & Volume Coordinates */}
+      <div className="flex flex-wrap items-center justify-between px-4 py-1.5 bg-[#070b14] border-t border-slate-800 text-[11px] text-slate-400 font-mono gap-2">
+        <div className="flex flex-wrap items-center gap-3">
           <span className="flex items-center gap-1.5">
-            <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : isSimulation ? 'bg-amber-400' : 'bg-rose-500'}`}></span>
-            <span>{isConnected ? 'cTrader: LIVE STREAMING' : isSimulation ? 'SIMULATION MODE ACTIVE' : 'cTrader: NOT CONNECTED'}</span>
+            <span className={`w-2 h-2 rounded-full ${
+              !isMarketOpen
+                ? 'bg-amber-400'
+                : isConnected
+                ? (isStale ? 'bg-rose-500' : 'bg-emerald-400 animate-pulse')
+                : isSimulation
+                ? 'bg-amber-400'
+                : 'bg-rose-500'
+            }`}></span>
+            <span className="font-bold text-slate-300">
+              DATA SOURCE: {provider === 'BINANCE' ? `BINANCE ${binanceMarketType}` : dataSource.toUpperCase()} ({exactBrokerSymbol || symbol})
+            </span>
           </span>
-          <span>VOLUME: APPROXIMATE (tick volume)</span>
+          <span className="text-slate-500">|</span>
+          <span>
+            VOLUME: <strong className={volumeType === 'NONE' ? 'text-amber-300' : 'text-emerald-400'}>
+              {volumeType === 'REAL_VOLUME' ? 'REAL (Binance trade execution)' : volumeType}
+            </strong>
+          </span>
+          <span className="text-slate-500">|</span>
+          <span>
+            STATUS: <strong className={isMarketOpen ? 'text-emerald-400' : 'text-amber-300'}>{isMarketOpen ? 'OPEN' : 'MARKET CLOSED'}</strong>
+          </span>
+          {formingCandle && isMarketOpen && (
+            <>
+              <span className="text-slate-500">|</span>
+              <span className="text-cyan-400 font-semibold">
+                FORMING CANDLE: ACTIVE
+              </span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <span>UTC {new Date().toISOString().substring(11, 19)}</span>

@@ -186,11 +186,10 @@ data class AlertNotification(
     val read: Boolean = false
 )
 
-data class CTraderConfig(
-    val clientId: String = "",
-    val environment: String = "DEMO",
+data class MarketDataConfig(
     val connected: Boolean = false,
     val simulationMode: Boolean = false, // OFF by default
     val latencyMs: Long? = null,
-    val isStale: Boolean = false
+    val isStale: Boolean = false,
+    val provider: String = "DERIV"
 )

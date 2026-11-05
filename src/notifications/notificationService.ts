@@ -3,7 +3,7 @@ import { playSignalChime } from './audioAlerts';
 
 export const DEFAULT_NOTIFICATION_CONTROLS: NotificationControls = {
   enabled: true,
-  selectedInstruments: ['XAU/USD', 'EUR/USD', 'GBP/USD', 'US30', 'NAS100', 'BTC/USD'],
+  selectedInstruments: ['XAU/USD', 'EUR/USD', 'GBP/USD', 'US30', 'NAS100', 'US100', 'BTC/USDT', 'ETH/USDT', 'SOL/USDT'],
   selectedNotificationTypes: [
     'BUY_SETUP',
     'SELL_SETUP',
@@ -130,14 +130,22 @@ export function formatSignalNotification(signal: TradingSignal): AlertNotificati
   const title = `GREVIN AI — ${directionTitle} [GRADE ${signal.grade}]`;
   const tfText = `${signal.timeframe}${signal.confirmationTimeframe ? ` / ${signal.confirmationTimeframe} confirmation` : ''}`;
 
+  const marketLabel = signal.marketType ? ` [${signal.marketType} • ${signal.exactSymbol || signal.symbol}]` : '';
+  const volLabel = signal.volumeType === 'REAL_VOLUME' ? ' (REAL VOLUME)' : '';
+  const sessionText = signal.sessionLabel || signal.session;
+
+  const rDistText = signal.stopDistanceFormatted || signal.rDistanceFormatted || `${signal.riskPips} pips`;
+  const tp1DistText = signal.tp1DistanceFormatted || `${signal.rewardPips} pips`;
+  const mathRatio = signal.tp1OverRRatio || 'TP1 / R = 2.00 OK';
+
   const body = [
-    `Instrument: ${signal.symbol}`,
-    `Timeframe: ${tfText}`,
-    `Strategy: ${signal.strategyName}`,
-    `Setup Grade: ${signal.grade}`,
+    `Instrument: ${signal.symbol}${marketLabel}${volLabel}`,
+    `Session: ${sessionText}`,
+    `Timeframe: ${tfText} | Strategy: ${signal.strategyName}`,
+    `Entry: ${signal.entryPrice} | SL: ${signal.stopLoss} (R: ${rDistText})`,
+    `TP1: ${signal.tp} (TP1: ${tp1DistText}) | ${mathRatio}`,
     `Status: ${signal.status === 'VALID' ? 'Confirmation received' : 'Monitoring conditions'}`,
-    `Entry: ${signal.entryPrice} | SL: ${signal.stopLoss} | Target: ${signal.tp} (2R)`,
-    `Entry, stop-loss, and target: Open GREVIN AI to view verified levels.`
+    `Notice: ${signal.newsProtectionNotice || 'News protection NOT VERIFIED'}`
   ].join('\n');
 
   return {
@@ -153,7 +161,7 @@ export function formatSignalNotification(signal: TradingSignal): AlertNotificati
     stopLoss: signal.stopLoss,
     takeProfit: signal.tp,
     grade: signal.grade,
-    reason: signal.reason,
+    reason: `${signal.reason} [${mathRatio} • R: ${rDistText} • TP1: ${tp1DistText}]`,
     timestamp: Date.now(),
     read: false
   };

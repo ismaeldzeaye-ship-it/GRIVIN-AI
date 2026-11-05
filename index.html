@@ -3,6 +3,86 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        // Intercept Vite HMR WebSocket before @vite/client loads
+        if (typeof window !== 'undefined' && window.WebSocket) {
+          const OriginalWebSocket = window.WebSocket;
+          function CustomWebSocket(url, protocols) {
+            const urlStr = String(url || '');
+            const isViteHmr =
+              protocols === 'vite-hmr' ||
+              (Array.isArray(protocols) && protocols.includes('vite-hmr')) ||
+              urlStr.includes('vite-hmr') ||
+              (!urlStr.includes('derivws.com') && !urlStr.includes('binance.com'));
+
+            if (isViteHmr) {
+              const dummy = Object.create(CustomWebSocket.prototype);
+              dummy.readyState = 1; // WebSocket.OPEN
+              dummy.url = urlStr;
+              dummy.protocol = 'vite-hmr';
+              dummy.send = function() {};
+              dummy.close = function() {};
+              dummy.addEventListener = function(type, listener) {
+                if (type === 'open') {
+                  setTimeout(() => {
+                    try {
+                      if (typeof listener === 'function') listener({ type: 'open' });
+                      if (typeof dummy.onopen === 'function') dummy.onopen({ type: 'open' });
+                    } catch (_) {}
+                  }, 0);
+                }
+              };
+              dummy.removeEventListener = function() {};
+              dummy.dispatchEvent = function() { return false; };
+              dummy.onopen = null;
+              dummy.onclose = null;
+              dummy.onerror = null;
+              dummy.onmessage = null;
+              return dummy;
+            }
+            return new OriginalWebSocket(url, protocols);
+          }
+          CustomWebSocket.prototype = OriginalWebSocket.prototype;
+          CustomWebSocket.CONNECTING = 0;
+          CustomWebSocket.OPEN = 1;
+          CustomWebSocket.CLOSING = 2;
+          CustomWebSocket.CLOSED = 3;
+          window.WebSocket = CustomWebSocket;
+        }
+
+        // Deep console error silencer for Vite WebSocket HMR notices
+        const origConsoleError = console.error;
+        console.error = function(...args) {
+          for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            const str = (typeof arg === 'string' ? arg : (arg && (arg.message || arg.stack || String(arg)))) || '';
+            if (str.includes('[vite]') || str.includes('WebSocket closed without opened') || str.includes('vite-hmr')) {
+              return;
+            }
+          }
+          origConsoleError.apply(console, args);
+        };
+
+        window.addEventListener('error', function(event) {
+          const msg = (event.message || '') + ' ' + (event.filename || '') + ' ' + (event.error?.stack || '');
+          if (msg.includes('[vite]') || msg.includes('WebSocket closed without opened')) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(event) {
+          const reasonStr = String(event.reason || '') + ' ' + (event.reason?.stack || '');
+          if (reasonStr.includes('WebSocket closed without opened') || reasonStr.includes('[vite]')) {
+            event.stopImmediatePropagation();
+            event.preventDefault();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
     <title>GREVIN AI - Institutional Signals &amp; SMC Engine</title>
     <meta name="description" content="Institutional trading signals, market sessions, volume profile POC/VAH/VAL, smart money concepts, and real-time push notifications." />
     <meta property="og:title" content="GREVIN AI - Institutional Signals &amp; SMC Engine" />

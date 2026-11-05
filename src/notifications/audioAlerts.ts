@@ -70,7 +70,9 @@ export function playSignalChime(type: 'BUY' | 'SELL' | 'BOS' | 'ALERT' | 'STALE'
       osc.start(now);
       osc.stop(now + 0.25);
     }
-  } catch (err) {
-    console.warn('Audio alert not allowed before user gesture:', err);
+  } catch (err: any) {
+    if (err?.name !== 'NotAllowedError') {
+      console.warn('Audio alert skipped:', err?.message || err);
+    }
   }
 }

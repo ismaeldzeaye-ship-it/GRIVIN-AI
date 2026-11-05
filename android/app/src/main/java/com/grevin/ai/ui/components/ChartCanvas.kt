@@ -35,7 +35,7 @@ fun ChartCanvas(
     ) {
         if (candles.isEmpty()) {
             Text(
-                text = "cTrader Not Connected — No live feed available",
+                text = "Market Data Not Connected — No live feed available",
                 color = GrevinTextMuted,
                 modifier = Modifier.align(Alignment.Center)
             )

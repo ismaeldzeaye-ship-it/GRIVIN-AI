@@ -300,7 +300,7 @@ object SetupEngine {
             InstitutionalChecklistItem("3", "Market Structure Confluence (BOS/CHoCH)", hasBOS, true, "Direction aligns with order flow structure break"),
             InstitutionalChecklistItem("4", "Volume Surge / Relative Volume", volumeSurge, false, "Current volume exceeds prior candle"),
             InstitutionalChecklistItem("5", "Clean Rejection Wick", cleanRejectionWick, false, "Evidence of institutional absorption"),
-            InstitutionalChecklistItem("6", "Spread under 3 pips", true, false, "Tight execution spread on cTrader"),
+            InstitutionalChecklistItem("6", "Spread under 3 pips", true, false, "Tight execution spread on verified market feed"),
             InstitutionalChecklistItem("7", "Strict 2R Target Set", true, true, "2.0 reward-to-risk ratio maintained"),
             InstitutionalChecklistItem("8", "No Immediate High-Impact News", true, false, "Economic calendar clear")
         )

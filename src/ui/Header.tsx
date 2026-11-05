@@ -1,5 +1,5 @@
 import React from 'react';
-import { MarketSessionType, CTraderConfig } from '../types';
+import { MarketSessionType, MarketDataConfig } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 import { 
   Activity, 
@@ -27,7 +27,7 @@ interface HeaderProps {
     isOverlap: boolean;
     dstStatus: { usDST: boolean; ukDST: boolean };
   };
-  cTraderConfig: CTraderConfig;
+  marketDataConfig: MarketDataConfig;
   unreadAlertCount: number;
   soundEnabled: boolean;
   onToggleSound: () => void;
@@ -39,18 +39,38 @@ export const Header: React.FC<HeaderProps> = ({
   currentTab,
   onSelectTab,
   currentSession,
-  cTraderConfig,
+  marketDataConfig,
   unreadAlertCount,
   soundEnabled,
   onToggleSound,
   onTriggerTestPush,
   onOpenSettings
 }) => {
+  // Live 1-second ticking UTC Clock (Requirement 8)
+  const [utcClock, setUtcClock] = React.useState<string>(() => {
+    const d = new Date();
+    return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')} UTC`;
+  });
+
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      const d = new Date();
+      setUtcClock(`${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')} UTC`);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   const getSessionColor = () => {
     if (currentSession.isOverlap) return 'bg-rose-500/10 text-rose-400 border-rose-500/30';
-    if (currentSession.session === 'LONDON') return 'bg-purple-500/10 text-purple-400 border-purple-500/30';
-    if (currentSession.session === 'NEW_YORK') return 'bg-amber-500/10 text-amber-400 border-amber-500/30';
-    if (currentSession.session === 'ASIAN') return 'bg-sky-500/10 text-sky-400 border-sky-500/30';
+    if (currentSession.label?.includes('London Killzone') || currentSession.label?.includes('London Mid') || currentSession.session === 'LONDON') {
+      return 'bg-purple-500/10 text-purple-400 border-purple-500/30';
+    }
+    if (currentSession.label?.includes('NY') || currentSession.session === 'NEW_YORK') {
+      return 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+    }
+    if (currentSession.label?.includes('Late') || currentSession.label?.includes('Asian') || currentSession.session === 'ASIAN') {
+      return 'bg-sky-500/10 text-sky-400 border-sky-500/30';
+    }
     return 'bg-slate-800 text-slate-400 border-slate-700';
   };
 
@@ -61,7 +81,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'alerts', label: 'Alerts & Push', icon: Bell, badge: unreadAlertCount },
     { id: 'backtest', label: 'Backtest', icon: BarChart3 },
     { id: 'journal', label: 'Journal', icon: BookOpen },
-    { id: 'ctrader', label: 'Market Data', icon: Wifi }
+    { id: 'market-data', label: 'Market Data', icon: Wifi }
   ];
 
   return (
@@ -90,6 +110,12 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="font-bold">{currentSession.label}</span>
           </div>
 
+          {/* Live UTC Master Clock (Requirement 8) */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900 text-cyan-300 font-mono text-[11px] border border-cyan-500/20 shadow-sm" title="Institutional UTC Master Clock (Pure UTC calculation)">
+            <Clock className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+            <span className="font-bold tracking-wider">{utcClock}</span>
+          </div>
+
           {/* Daylight Saving Time Indicator */}
           <div className="hidden xl:flex items-center gap-1 text-[11px] font-mono text-slate-400 bg-slate-900/60 px-2 py-0.5 rounded border border-slate-800">
             <Globe className="w-3 h-3 text-cyan-400" />
@@ -99,29 +125,53 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Status Indicators & Controls */}
         <div className="flex items-center gap-2.5">
-          {/* cTrader Connection Badge */}
+          {/* Market Data / Deriv Connection Badge */}
           <div 
-            onClick={() => onSelectTab('ctrader')}
+            onClick={() => onSelectTab('market-data')}
             className={`cursor-pointer flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-mono border transition ${
-              cTraderConfig.simulationMode
+              marketDataConfig.simulationMode
                 ? 'bg-amber-950/40 text-amber-300 border-amber-500/40 hover:bg-amber-900/50'
-                : cTraderConfig.connected && !cTraderConfig.isStale
+                : marketDataConfig.deriv?.connected && !marketDataConfig.deriv?.isStale
+                ? 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30 hover:bg-emerald-900/50'
+                : marketDataConfig.connected && !marketDataConfig.isStale
                 ? 'bg-emerald-950/40 text-emerald-300 border-emerald-500/30 hover:bg-emerald-900/50'
                 : 'bg-rose-950/40 text-rose-300 border-rose-500/30 hover:bg-rose-900/50'
             }`}
-            title="cTrader Open API Connection Status"
+            title="Deriv Public WebSocket Market Data Status"
           >
             <Radio className={`w-3 h-3 ${
-              cTraderConfig.simulationMode ? 'text-amber-400' : cTraderConfig.connected ? 'text-emerald-400 animate-pulse' : 'text-rose-400'
+              marketDataConfig.simulationMode
+                ? 'text-amber-400'
+                : marketDataConfig.deriv?.connected
+                ? 'text-emerald-400 animate-pulse'
+                : 'text-rose-400'
             }`} />
             <span>
-              {cTraderConfig.simulationMode 
+              {marketDataConfig.simulationMode 
                 ? 'SIMULATION MODE' 
-                : cTraderConfig.connected 
-                ? `cTrader: ${cTraderConfig.latencyMs !== null ? `${cTraderConfig.latencyMs}ms` : 'Connected'}` 
-                : 'cTrader: NOT CONNECTED'}
+                : marketDataConfig.deriv?.connected 
+                ? `DERIV: ${marketDataConfig.deriv?.latencyMs !== null ? `${marketDataConfig.deriv?.latencyMs}ms` : 'Connected'}` 
+                : `DERIV: ${marketDataConfig.deriv?.status || 'NOT CONNECTED'}`}
             </span>
           </div>
+
+          {/* Rate Limit Status Chip (Clears automatically on success) */}
+          {marketDataConfig.rateLimitState && (
+            <div 
+              onClick={() => onSelectTab('market-data')}
+              className={`cursor-pointer flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-mono border transition ${
+                marketDataConfig.rateLimitState.isRateLimited
+                  ? 'bg-amber-950/70 text-amber-300 border-amber-500/40 animate-pulse'
+                  : 'bg-emerald-950/40 text-emerald-400 border-emerald-500/20'
+              }`}
+              title={marketDataConfig.rateLimitState.message || 'Requests operating within normal limits'}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${
+                marketDataConfig.rateLimitState.isRateLimited ? 'bg-amber-400' : 'bg-emerald-400'
+              }`}></span>
+              <span>{marketDataConfig.rateLimitState.isRateLimited ? 'Rate-limited, retrying' : 'OK'}</span>
+            </div>
+          )}
 
           {/* Push Test Button */}
           <button

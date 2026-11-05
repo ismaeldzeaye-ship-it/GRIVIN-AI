@@ -6,7 +6,7 @@ export interface PositionCalculationParams {
   entryPrice: number;
   stopLossPrice: number;
   tpPrice?: number; // Single 2R take profit
-  symbolInfo?: SymbolInfo; // Real cTrader symbol specifications
+  symbolInfo?: SymbolInfo; // Verified broker symbol specifications
 }
 
 export interface PositionCalculationResult {
@@ -24,7 +24,7 @@ export interface PositionCalculationResult {
 export function calculatePositionSize(params: PositionCalculationParams): PositionCalculationResult {
   const { accountBalance, riskPercent, entryPrice, stopLossPrice, tpPrice, symbolInfo } = params;
 
-  // Requirement 4: Take pip/tick value and contract size from the cTrader symbol data.
+  // Take pip/tick value and contract size from symbol data.
   // If specs are unavailable, say position size cannot be calculated.
   if (
     !symbolInfo ||
@@ -35,7 +35,7 @@ export function calculatePositionSize(params: PositionCalculationParams): Positi
   ) {
     return {
       canCalculate: false,
-      unavailabilityReason: 'Position size cannot be calculated (symbol specifications unavailable from cTrader).'
+      unavailabilityReason: 'Position size cannot be calculated (symbol specifications unavailable).'
     };
   }
 

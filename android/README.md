@@ -14,7 +14,7 @@ This directory contains the complete native Android port of the GREVIN AI Instit
   3. `CONFIRMED_BREAKOUT`: Breakout beyond VAH/VAL, pullback <= 50% VA height, confirmed BOS.
   - Strict single 2R take-profit target (`rMultiple = 2.0`).
   - Institutional Setup Grade checklist (Grade A, B, or C).
-- **`engine/RiskEngine.kt`**: Dynamic position sizing taking pip value and contract size from cTrader symbol specs with safe fallback when specs are unavailable.
+- **`engine/RiskEngine.kt`**: Dynamic position sizing taking pip value and contract size from verified symbol specs with safe fallback when specs are unavailable.
 - **`engine/VerificationEngine.kt`**: All 8 institutional unit tests in Kotlin.
 - **`notifications/`**: `GrevinNotificationManager` & `GrevinFirebaseMessagingService` for native FCM push notifications when the app is closed or in background.
 - **`ui/`**: Jetpack Compose UI with dark institutional fintech design (`#050811`, `#0B0F19`, cyan, amber, emerald highlights).

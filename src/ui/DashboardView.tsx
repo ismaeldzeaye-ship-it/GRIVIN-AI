@@ -120,6 +120,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-400 font-mono">
                       {sym.category}
                     </span>
+                    {sym.provider === 'BINANCE' && (
+                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-950/70 text-amber-300 font-mono font-bold border border-amber-500/30">
+                        {sym.marketType || 'SPOT'}
+                      </span>
+                    )}
+                    {!sym.isMarketOpen && (
+                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-950/80 text-amber-300 font-mono font-bold border border-amber-500/30">
+                        CLOSED
+                      </span>
+                    )}
                   </div>
                   <div className={`flex items-center gap-0.5 text-xs font-mono font-bold ${
                     isPositive ? 'text-emerald-400' : 'text-rose-400'
@@ -141,7 +151,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </div>
 
                 <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Spread: <strong className="text-amber-300">{sym.spreadPips} pips</strong></span>
+                  <span>
+                    {!sym.isMarketOpen ? (
+                      <strong className="text-amber-300">MARKET CLOSED</strong>
+                    ) : (
+                      <>Spread: <strong className="text-amber-300">{sym.spreadPips} pips</strong></>
+                    )}
+                  </span>
                   <span className="group-hover:text-cyan-400 transition flex items-center gap-0.5">
                     Open Chart <ChevronRight className="w-3 h-3" />
                   </span>
@@ -171,15 +187,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="w-10 h-10 rounded-full bg-slate-900 border border-slate-800 text-rose-400 mx-auto flex items-center justify-center font-bold">
               !
             </div>
-            <h3 className="text-sm font-bold text-slate-200">cTrader Not Connected</h3>
+            <h3 className="text-sm font-bold text-slate-200">Market Data Not Connected</h3>
             <p className="text-xs text-slate-400 max-w-md mx-auto">
-              No live signals are generated without a verified cTrader connection. Connect your credentials in Market Data or toggle Simulation Mode to preview institutional setups.
+              No live signals are generated without an active Deriv WebSocket or Binance feed. Verify feeds in Market Data or toggle Simulation Mode to preview setups.
             </p>
             <button
               onClick={onNavigateToConnection}
               className="mt-2 px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs transition"
             >
-              Configure cTrader Connection
+              Open Market Data Settings
             </button>
           </div>
         ) : signals.length === 0 ? (
@@ -197,13 +213,28 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 >
                   <div>
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className={`px-2 py-0.5 rounded text-[11px] font-black uppercase font-mono ${
                           isBuy ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                         }`}>
                           {sig.direction}
                         </span>
                         <span className="font-bold text-slate-100 text-sm">{sig.symbol}</span>
+                        {sig.marketType && (
+                          <span className="px-1.5 py-0.2 rounded text-[10px] font-mono font-bold bg-amber-950/70 text-amber-300 border border-amber-500/30">
+                            {sig.marketType}
+                          </span>
+                        )}
+                        {sig.exactSymbol && (
+                          <span className="text-[10px] font-mono text-cyan-300 bg-slate-900 px-1.5 py-0.2 rounded border border-slate-700">
+                            {sig.exactSymbol}
+                          </span>
+                        )}
+                        {sig.volumeType === 'REAL_VOLUME' && (
+                          <span className="px-1.5 py-0.2 rounded text-[10px] font-mono font-bold bg-emerald-950/70 text-emerald-300 border border-emerald-500/30">
+                            REAL VOL
+                          </span>
+                        )}
                       </div>
                       <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded border ${
                         sig.grade === 'A' ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' :

@@ -82,7 +82,7 @@ fun RiskCalculatorScreen(
             fontFamily = FontFamily.Monospace
         )
         Text(
-            text = "Dynamic cTrader contract specs • Hardcoded specifications removed",
+            text = "Dynamic verified symbol specs • Hardcoded specifications removed",
             color = GrevinTextMuted,
             fontSize = 11.sp
         )
@@ -171,7 +171,7 @@ fun RiskCalculatorScreen(
                         fontSize = 12.sp
                     )
                     Text(
-                        text = "Real cTrader symbol parameters required to prevent incorrect lot execution.",
+                        text = "Real verified symbol parameters required to prevent incorrect lot execution.",
                         color = GrevinTextMuted,
                         fontSize = 10.sp
                     )

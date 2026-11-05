@@ -11,12 +11,23 @@ export interface SessionBoundary {
   borderColor: string;
 }
 
+export interface UtcSessionState {
+  sessionKey: 'ASIAN' | 'LONDON_KILLZONE' | 'LONDON_MID' | 'LONDON_NY_OVERLAP' | 'NY_AFTERNOON' | 'LATE' | 'CLOSED';
+  label: string;
+  utcTimeStr: string;
+  timestamp: number;
+  isQuietHours: boolean; // Asian (00-07) and Late (21-24)
+  isFirstTwoMinutes: boolean; // Volatility buffer at session open (minutes 0 and 1)
+  allowsSignals: boolean;
+  marketOpen: boolean;
+}
+
 /**
  * Daylight Saving Time (DST) checker for US and UK/EU:
  * US: 2nd Sunday in March to 1st Sunday in November
  * UK/EU: Last Sunday in March to Last Sunday in October
  */
-export function isDaylightSavingTime(date: Date): { usDST: boolean; ukDST: boolean } {
+export function isDaylightSavingTime(date: Date = new Date()): { usDST: boolean; ukDST: boolean } {
   const year = date.getUTCFullYear();
   const time = date.getTime();
 
@@ -42,72 +53,241 @@ export function isDaylightSavingTime(date: Date): { usDST: boolean; ukDST: boole
 }
 
 /**
+ * Checks if a given timestamp or Date is during regular New York equity trading hours
+ * (09:30 - 16:00 New York time, Monday through Friday, DST-aware).
+ */
+export function isNewYorkRegularHours(timestampSecOrDate: number | Date = new Date()): boolean {
+  const d = typeof timestampSecOrDate === 'number'
+    ? (timestampSecOrDate > 1e11 ? new Date(timestampSecOrDate) : new Date(timestampSecOrDate * 1000))
+    : timestampSecOrDate;
+  const day = d.getUTCDay(); // 0 = Sun, 6 = Sat
+  if (day === 0 || day === 6) {
+    return false; // Weekend is strictly off-hours
+  }
+
+  const { usDST } = isDaylightSavingTime(d);
+  // In EDT (summer, UTC-4): 09:30 NY is 13:30 UTC, 16:00 NY is 20:00 UTC.
+  // In EST (winter, UTC-5): 09:30 NY is 14:30 UTC, 16:00 NY is 21:00 UTC.
+  const openMinutesUtc = (usDST ? 13 : 14) * 60 + 30;
+  const closeMinutesUtc = (usDST ? 20 : 21) * 60;
+
+  const currentMinutesUtc = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return currentMinutesUtc >= openMinutesUtc && currentMinutesUtc < closeMinutesUtc;
+}
+
+/**
+ * Returns previous regular New York session boundaries (09:30 to 16:00 NY).
+ * Used specifically for SPY/QQQ volume profiles.
+ */
+export function getPreviousRegularSessionWindow(referenceTimeMs: number = Date.now()): {
+  startTime: number;
+  endTime: number;
+  label: string;
+} {
+  const refDate = new Date(referenceTimeMs);
+  const { usDST } = isDaylightSavingTime(refDate);
+
+  const openHourUtc = usDST ? 13 : 14;
+  const openMinUtc = 30;
+  const closeHourUtc = usDST ? 20 : 21;
+  const closeMinUtc = 0;
+
+  // Search backward day by day to find the most recent completed regular weekday session
+  const d = new Date(referenceTimeMs);
+  const currentTotalMins = refDate.getUTCHours() * 60 + refDate.getUTCMinutes();
+  const todayCloseMins = closeHourUtc * 60 + closeMinUtc;
+
+  // If today is a weekday and already after market close (>= closeHourUtc:closeMinUtc),
+  // today's regular session is the completed one.
+  const dayOfWeek = refDate.getUTCDay();
+  let daysBack = (dayOfWeek >= 1 && dayOfWeek <= 5 && currentTotalMins >= todayCloseMins) ? 0 : 1;
+
+  while (true) {
+    const targetDate = new Date(referenceTimeMs - daysBack * 86400000);
+    const day = targetDate.getUTCDay();
+    if (day >= 1 && day <= 5) {
+      // Valid weekday found
+      const yr = targetDate.getUTCFullYear();
+      const mo = targetDate.getUTCMonth();
+      const dt = targetDate.getUTCDate();
+      const startTime = Date.UTC(yr, mo, dt, openHourUtc, openMinUtc, 0) / 1000;
+      const endTime = Date.UTC(yr, mo, dt, closeHourUtc, closeMinUtc, 0) / 1000;
+      return {
+        startTime,
+        endTime,
+        label: `Previous NY Regular Session (${targetDate.toISOString().slice(0, 10)} 09:30-16:00 NY)`
+      };
+    }
+    daysBack++;
+  }
+}
+
+/**
+ * Checks if current time is within the first 2 minutes after session open
+ * (volatility buffer; block signals during minutes 0 and 1 of session open).
+ * Boundaries: 00:00, 07:00, 10:00, 12:00, 15:00, 21:00 UTC.
+ */
+export function isFirstTwoMinutesOfSession(date: Date = new Date()): boolean {
+  const hour = date.getUTCHours();
+  const minute = date.getUTCMinutes();
+
+  const isBoundaryHour = [0, 7, 10, 12, 15, 21].includes(hour);
+  return isBoundaryHour && (minute === 0 || minute === 1);
+}
+
+/**
+ * Pure UTC Institutional Session Calculator:
+ * - Asian: 00:00 - 07:00 UTC (Quiet hours)
+ * - London Killzone: 07:00 - 10:00 UTC
+ * - London Mid-Session: 10:00 - 12:00 UTC
+ * - London/NY Overlap: 12:00 - 15:00 UTC
+ * - NY Afternoon: 15:00 - 21:00 UTC
+ * - Late: 21:00 - 24:00 UTC (Quiet hours)
+ */
+export function getUtcSessionState(date: Date = new Date()): UtcSessionState {
+  const day = date.getUTCDay();
+  const hour = date.getUTCHours();
+  const minute = date.getUTCMinutes();
+  const totalMins = hour * 60 + minute;
+  const timeFormatted = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} UTC`;
+  const isFirstTwoMins = isFirstTwoMinutesOfSession(date);
+
+  // Weekend check for standard markets (Friday 22:00 UTC to Sunday 21:00 UTC)
+  const isWeekend = day === 6 || (day === 5 && totalMins >= 22 * 60) || (day === 0 && totalMins < 21 * 60);
+
+  if (totalMins < 7 * 60) {
+    // 00:00 - 07:00 Asian Session
+    return {
+      sessionKey: 'ASIAN',
+      label: 'Asian Session (00:00–07:00 UTC)',
+      utcTimeStr: timeFormatted,
+      timestamp: date.getTime(),
+      isQuietHours: true,
+      isFirstTwoMinutes: isFirstTwoMins,
+      allowsSignals: true, // Controlled by allowQuietHoursSignals switch
+      marketOpen: !isWeekend
+    };
+  }
+
+  if (totalMins < 10 * 60) {
+    // 07:00 - 10:00 London Killzone
+    return {
+      sessionKey: 'LONDON_KILLZONE',
+      label: 'London Killzone (07:00–10:00 UTC)',
+      utcTimeStr: timeFormatted,
+      timestamp: date.getTime(),
+      isQuietHours: false,
+      isFirstTwoMinutes: isFirstTwoMins,
+      allowsSignals: true,
+      marketOpen: !isWeekend
+    };
+  }
+
+  if (totalMins < 12 * 60) {
+    // 10:00 - 12:00 London Mid-Session
+    return {
+      sessionKey: 'LONDON_MID',
+      label: 'London Mid-Session (10:00–12:00 UTC)',
+      utcTimeStr: timeFormatted,
+      timestamp: date.getTime(),
+      isQuietHours: false,
+      isFirstTwoMinutes: isFirstTwoMins,
+      allowsSignals: true,
+      marketOpen: !isWeekend
+    };
+  }
+
+  if (totalMins < 15 * 60) {
+    // 12:00 - 15:00 London/NY Overlap
+    return {
+      sessionKey: 'LONDON_NY_OVERLAP',
+      label: 'London/NY Overlap (12:00–15:00 UTC)',
+      utcTimeStr: timeFormatted,
+      timestamp: date.getTime(),
+      isQuietHours: false,
+      isFirstTwoMinutes: isFirstTwoMins,
+      allowsSignals: true,
+      marketOpen: !isWeekend
+    };
+  }
+
+  if (totalMins < 21 * 60) {
+    // 15:00 - 21:00 NY Afternoon
+    return {
+      sessionKey: 'NY_AFTERNOON',
+      label: 'NY Afternoon (15:00–21:00 UTC)',
+      utcTimeStr: timeFormatted,
+      timestamp: date.getTime(),
+      isQuietHours: false,
+      isFirstTwoMinutes: isFirstTwoMins,
+      allowsSignals: true,
+      marketOpen: !isWeekend
+    };
+  }
+
+  // 21:00 - 24:00 Late Session
+  return {
+    sessionKey: 'LATE',
+    label: 'Late Session (21:00–24:00 UTC)',
+    utcTimeStr: timeFormatted,
+    timestamp: date.getTime(),
+    isQuietHours: true,
+    isFirstTwoMinutes: isFirstTwoMins,
+    allowsSignals: true, // Controlled by allowQuietHoursSignals switch
+    marketOpen: !isWeekend
+  };
+}
+
+/**
  * Returns session schedules adjusted for UTC and DST.
  */
 export function getActiveSessionSchedules(date = new Date()): SessionBoundary[] {
-  const { usDST, ukDST } = isDaylightSavingTime(date);
-
-  // Asian session: 00:00 - 08:00 UTC (Tokyo/Sydney)
-  // London session: 07:00 or 08:00 UTC depending on UK DST (BST is UTC+1)
-  // When UK is on BST (summer), London opens at 07:00 UTC, closes 15:30 UTC.
-  // When UK is on GMT (winter), London opens at 08:00 UTC, closes 16:30 UTC.
-  const londonStart = ukDST ? 7 : 8;
-  const londonEndHour = ukDST ? 15 : 16;
-  const londonEndMin = 30;
-
-  // New York session: 8:00 AM - 5:00 PM EST/EDT
-  // US EDT (summer) is UTC-4 -> 12:00 UTC - 21:00 UTC
-  // US EST (winter) is UTC-5 -> 13:00 UTC - 22:00 UTC
-  const nyStart = usDST ? 12 : 13;
-  const nyEndHour = usDST ? 20 : 21;
-  const nyEndMin = 30;
-
   return [
     {
       name: 'ASIAN',
-      label: 'Asian Session (Tokyo/Sydney)',
+      label: 'Asian Session (00:00–07:00 UTC)',
       startHourUTC: 0,
       startMinuteUTC: 0,
-      endHourUTC: 8,
+      endHourUTC: 7,
       endMinuteUTC: 0,
       color: 'rgba(56, 189, 248, 0.12)',
       borderColor: '#38bdf8'
     },
     {
       name: 'LONDON',
-      label: 'London Session (Pre-NY)',
-      startHourUTC: londonStart,
+      label: 'London Session (07:00–12:00 UTC)',
+      startHourUTC: 7,
       startMinuteUTC: 0,
-      endHourUTC: londonEndHour,
-      endMinuteUTC: londonEndMin,
+      endHourUTC: 12,
+      endMinuteUTC: 0,
       color: 'rgba(168, 85, 247, 0.12)',
       borderColor: '#a855f7'
     },
     {
-      name: 'NEW_YORK',
-      label: 'New York Session',
-      startHourUTC: nyStart,
-      startMinuteUTC: 0,
-      endHourUTC: nyEndHour,
-      endMinuteUTC: nyEndMin,
-      color: 'rgba(234, 179, 8, 0.12)',
-      borderColor: '#eab308'
-    },
-    {
       name: 'LONDON_NY_OVERLAP',
-      label: 'London / NY Institutional Overlap',
-      startHourUTC: nyStart,
+      label: 'London / NY Overlap (12:00–15:00 UTC)',
+      startHourUTC: 12,
       startMinuteUTC: 0,
-      endHourUTC: londonEndHour,
-      endMinuteUTC: londonEndMin,
+      endHourUTC: 15,
+      endMinuteUTC: 0,
       color: 'rgba(239, 68, 68, 0.18)',
       borderColor: '#ef4444'
+    },
+    {
+      name: 'NEW_YORK',
+      label: 'NY Afternoon (15:00–21:00 UTC)',
+      startHourUTC: 15,
+      startMinuteUTC: 0,
+      endHourUTC: 21,
+      endMinuteUTC: 0,
+      color: 'rgba(234, 179, 8, 0.12)',
+      borderColor: '#eab308'
     }
   ];
 }
 
 /**
- * Determine the current market session given a timestamp or Date.
+ * Determine the current market session given a timestamp or Date (backward compatible).
  */
 export function getCurrentSession(date = new Date()): {
   session: MarketSessionType;
@@ -115,78 +295,20 @@ export function getCurrentSession(date = new Date()): {
   isOverlap: boolean;
   dstStatus: { usDST: boolean; ukDST: boolean };
 } {
-  const day = date.getUTCDay();
+  const state = getUtcSessionState(date);
   const dst = isDaylightSavingTime(date);
 
-  // Weekend check: closed from Friday 22:00 UTC to Sunday 21:00 UTC
-  const hour = date.getUTCHours();
-  const min = date.getUTCMinutes();
-  const totalMins = hour * 60 + min;
-
-  if (day === 6 || (day === 5 && totalMins >= 22 * 60) || (day === 0 && totalMins < 21 * 60)) {
-    return {
-      session: 'CLOSED',
-      label: 'Weekend — Market Closed',
-      isOverlap: false,
-      dstStatus: dst
-    };
-  }
-
-  const schedules = getActiveSessionSchedules(date);
-  const overlap = schedules.find(s => s.name === 'LONDON_NY_OVERLAP')!;
-  const ny = schedules.find(s => s.name === 'NEW_YORK')!;
-  const london = schedules.find(s => s.name === 'LONDON')!;
-  const asian = schedules.find(s => s.name === 'ASIAN')!;
-
-  const overlapStart = overlap.startHourUTC * 60 + overlap.startMinuteUTC;
-  const overlapEnd = overlap.endHourUTC * 60 + overlap.endMinuteUTC;
-
-  if (totalMins >= overlapStart && totalMins < overlapEnd) {
-    return {
-      session: 'LONDON_NY_OVERLAP',
-      label: 'London / NY Overlap (Peak Volume)',
-      isOverlap: true,
-      dstStatus: dst
-    };
-  }
-
-  const nyStart = ny.startHourUTC * 60 + ny.startMinuteUTC;
-  const nyEnd = ny.endHourUTC * 60 + ny.endMinuteUTC;
-  if (totalMins >= nyStart && totalMins < nyEnd) {
-    return {
-      session: 'NEW_YORK',
-      label: 'New York Session',
-      isOverlap: false,
-      dstStatus: dst
-    };
-  }
-
-  const londonStart = london.startHourUTC * 60 + london.startMinuteUTC;
-  const londonEnd = london.endHourUTC * 60 + london.endMinuteUTC;
-  if (totalMins >= londonStart && totalMins < londonEnd) {
-    return {
-      session: 'LONDON',
-      label: 'London Session',
-      isOverlap: false,
-      dstStatus: dst
-    };
-  }
-
-  const asianStart = asian.startHourUTC * 60 + asian.startMinuteUTC;
-  const asianEnd = asian.endHourUTC * 60 + asian.endMinuteUTC;
-  if (totalMins >= asianStart && totalMins < asianEnd) {
-    return {
-      session: 'ASIAN',
-      label: 'Asian Session',
-      isOverlap: false,
-      dstStatus: dst
-    };
-  }
+  let session: MarketSessionType = 'ASIAN';
+  if (state.sessionKey === 'CLOSED') session = 'CLOSED';
+  else if (state.sessionKey === 'LONDON_KILLZONE' || state.sessionKey === 'LONDON_MID') session = 'LONDON';
+  else if (state.sessionKey === 'LONDON_NY_OVERLAP') session = 'LONDON_NY_OVERLAP';
+  else if (state.sessionKey === 'NY_AFTERNOON') session = 'NEW_YORK';
+  else session = 'ASIAN';
 
   return {
-    session: 'ASIAN',
-    label: 'Late NY / Pre-Asia Transition',
-    isOverlap: false,
+    session,
+    label: state.label,
+    isOverlap: state.sessionKey === 'LONDON_NY_OVERLAP',
     dstStatus: dst
   };
 }
@@ -218,4 +340,73 @@ export function getSessionHighLow(candles: Candle[], session: MarketSessionType)
   }
 
   return found ? { high, low } : null;
+}
+
+/**
+ * Returns previous profile session boundaries:
+ * - Crypto: UTC day (00:00 to 24:00 UTC).
+ * - Forex, Gold and Indices: 17:00 New York with daylight saving.
+ */
+export function getPreviousProfileSessionBoundaries(
+  referenceTimeMs: number = Date.now(),
+  isCrypto: boolean = false
+): { startTime: number; endTime: number; sessionLabel: string } {
+  const refDate = new Date(referenceTimeMs);
+
+  if (isCrypto) {
+    const year = refDate.getUTCFullYear();
+    const month = refDate.getUTCMonth();
+    const day = refDate.getUTCDate();
+    const todayMidnightUtc = Date.UTC(year, month, day, 0, 0, 0) / 1000;
+    const yesterdayMidnightUtc = todayMidnightUtc - 86400;
+    return {
+      startTime: yesterdayMidnightUtc,
+      endTime: todayMidnightUtc,
+      sessionLabel: `Crypto UTC Day (${new Date(yesterdayMidnightUtc * 1000).toISOString().slice(0, 10)})`
+    };
+  }
+
+  // Forex, Gold, Indices: 17:00 New York with daylight saving
+  const { usDST } = isDaylightSavingTime(refDate);
+  // In EDT (summer), 17:00 NY is 21:00 UTC. In EST (winter), 17:00 NY is 22:00 UTC.
+  const ny17HourUtc = usDST ? 21 : 22;
+
+  const year = refDate.getUTCFullYear();
+  const month = refDate.getUTCMonth();
+  const day = refDate.getUTCDate();
+
+  const boundaryTodayUtc = Date.UTC(year, month, day, ny17HourUtc, 0, 0) / 1000;
+  const refSec = Math.floor(referenceTimeMs / 1000);
+
+  let currentSessionStart: number;
+  if (refSec >= boundaryTodayUtc) {
+    currentSessionStart = boundaryTodayUtc;
+  } else {
+    currentSessionStart = boundaryTodayUtc - 86400;
+  }
+
+  const prevSessionEnd = currentSessionStart;
+  const prevSessionStart = prevSessionEnd - 86400;
+
+  return {
+    startTime: prevSessionStart,
+    endTime: prevSessionEnd,
+    sessionLabel: `17:00 NY Profile (${usDST ? 'EDT 21:00 UTC' : 'EST 22:00 UTC'})`
+  };
+}
+
+/**
+ * Returns the active institutional Kill Zone
+ */
+export function getInstitutionalKillZone(date: Date = new Date()): string {
+  const state = getUtcSessionState(date);
+  switch (state.sessionKey) {
+    case 'ASIAN': return 'ASIAN_SESSION';
+    case 'LONDON_KILLZONE': return 'LONDON_OPEN_KILLZONE';
+    case 'LONDON_MID': return 'LONDON_MID_SESSION';
+    case 'LONDON_NY_OVERLAP': return 'LONDON_NY_OVERLAP';
+    case 'NY_AFTERNOON': return 'NY_AFTERNOON';
+    case 'LATE': return 'LATE_SESSION';
+    default: return 'OUTSIDE_SESSION';
+  }
 }
