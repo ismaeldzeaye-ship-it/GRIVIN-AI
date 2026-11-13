@@ -14,7 +14,8 @@ import {
   AlertTriangle,
   ArrowRight,
   ShieldCheck,
-  Eye
+  Eye,
+  RotateCcw
 } from 'lucide-react';
 
 interface SignalDetailModalProps {
@@ -52,10 +53,10 @@ export const SignalDetailModal: React.FC<SignalDetailModalProps> = ({
     symbolInfo
   });
 
-  const handleFetchAI = async () => {
+  const handleFetchAI = async (opts: { force?: boolean } = {}) => {
     setLoadingAI(true);
     try {
-      const text = await requestAISetupAnalysis(signal);
+      const text = await requestAISetupAnalysis(signal, undefined, opts);
       setAiAnalysisText(text);
     } catch {
       // fallback
@@ -482,19 +483,34 @@ export const SignalDetailModal: React.FC<SignalDetailModalProps> = ({
                 <Sparkles className="w-4 h-4 text-purple-400" />
                 GREVIN AI Setup Reasoning
               </span>
-              <button
-                onClick={handleFetchAI}
-                disabled={loadingAI}
-                className="text-[11px] text-cyan-400 hover:text-cyan-300 underline font-mono disabled:opacity-50"
-              >
-                {loadingAI ? 'Analyzing...' : 'Refresh AI Analysis'}
-              </button>
+              <div className="flex items-center gap-2">
+                {!aiAnalysisText && (
+                  <button
+                    type="button"
+                    onClick={() => handleFetchAI({ force: false })}
+                    disabled={loadingAI}
+                    className="text-[11px] text-slate-300 hover:text-slate-100 underline font-mono disabled:opacity-50"
+                  >
+                    Analyze
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => handleFetchAI({ force: true })}
+                  disabled={loadingAI}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-400 hover:text-cyan-300 text-[11px] font-mono border border-slate-700 transition disabled:opacity-50"
+                  title="Bypass cache with { force: true }"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${loadingAI ? 'animate-spin' : ''}`} />
+                  <span>{loadingAI ? 'Refreshing...' : 'Refresh'}</span>
+                </button>
+              </div>
             </div>
 
             <div className="bg-slate-950/80 p-3 rounded-lg border border-slate-800 text-xs text-slate-300 leading-relaxed whitespace-pre-line font-sans">
               {aiAnalysisText || (
                 <div className="text-slate-500 italic">
-                  Tap &apos;Refresh AI Analysis&apos; to run full institutional order flow diagnosis.
+                  Tap &apos;Analyze&apos; or &apos;Refresh&apos; to run full institutional order flow diagnosis.
                 </div>
               )}
             </div>

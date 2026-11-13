@@ -456,3 +456,78 @@ export interface JournalEntry {
   tags: string[];
   executionRating: 1 | 2 | 3 | 4 | 5;
 }
+
+// -------------------------------------------------------------
+// UPGRADE MODULE 3: MODULAR SMC DATA STRUCTURES
+// -------------------------------------------------------------
+
+export interface EqualHighLowPool {
+  id: string;
+  type: 'EQH' | 'EQL';
+  price: number;
+  count: number;
+  indices: number[];
+  time: number;
+  swept: boolean;
+}
+
+export interface DisplacementBar {
+  index: number;
+  time: number;
+  direction: 'BULLISH' | 'BEARISH';
+  bodyRatio: number;
+  candle: Candle;
+}
+
+export interface PremiumDiscountZone {
+  rangeHigh: number;
+  rangeLow: number;
+  equilibrium: number; // 50% dealing range
+  currentZone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM';
+  percentile: number; // 0 to 100%
+}
+
+// -------------------------------------------------------------
+// UPGRADE MODULE 4 & 5: STRUCTURED EVIDENCE & SCHEMA-VALIDATED GEMINI
+// -------------------------------------------------------------
+
+export interface StructuredMarketEvidence {
+  symbol: string;
+  timeframe: string;
+  currentPrice: number;
+  session: string;
+  trend: 'BULLISH' | 'BEARISH' | 'RANGING';
+  marketStructure: {
+    lastBOS: { direction: string; price: number; time: string } | null;
+    lastCHOCH: { direction: string; price: number; time: string } | null;
+  };
+  volumeProfile: {
+    poc: number;
+    vah: number;
+    val: number;
+    priceRelation: 'ABOVE_VAH' | 'INSIDE_VALUE_AREA' | 'BELOW_VAL';
+  };
+  smc: {
+    activeOrderBlocks: number;
+    activeFVGs: number;
+    nearestOB?: { direction: string; top: number; bottom: number };
+    nearestFVG?: { direction: string; top: number; bottom: number };
+    liquiditySwept: boolean;
+    premiumDiscount?: PremiumDiscountZone;
+  };
+  atr14: number;
+}
+
+export interface GeminiMarketAnalysis {
+  bias: 'BUY' | 'SELL' | 'WAIT';
+  confidenceScore: number; // 0-100
+  institutionalNarrative: string;
+  orderFlowContext: string;
+  keyLevelsToWatch: {
+    invalidationLevel: number;
+    targetLevel: number;
+  };
+  liquidityObjective: string;
+  riskAssessment: string;
+}
+

@@ -135,13 +135,31 @@ class ConsoleAuditor {
 
     console.error = (...args: any[]) => {
       const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      // Completely ignore Vite HMR WebSocket errors in iframe/preview environment
+      if (msg.includes('[vite]') || msg.includes('WebSocket closed without opened') || msg.includes('vite-hmr')) {
+        return;
+      }
       this.recordError(msg);
       originalError.apply(console, args);
     };
   }
 
+  private notifyTimer: any = null;
+  private notify() {
+    if (this.notifyTimer) return;
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = null;
+      for (const listener of this.listeners) {
+        try {
+          listener();
+        } catch (_) {}
+      }
+    }, 50);
+  }
+
   private recordError(message: string) {
     if (!message) return;
+    if (message.includes('[vite]') || message.includes('WebSocket closed without opened')) return;
     const exists = this.errors.some(e => e.message === message);
     if (!exists) {
       this.errors.unshift({
@@ -200,14 +218,6 @@ class ConsoleAuditor {
   public subscribe(cb: () => void): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
-  }
-
-  private notify() {
-    for (const cb of this.listeners) {
-      try {
-        cb();
-      } catch {}
-    }
   }
 
   public getErrors(): ConsoleErrorEntry[] {

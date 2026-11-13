@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import webpush from 'web-push';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 
 dotenv.config();
 
@@ -58,11 +58,18 @@ let serverMarketState = {
 // Connected SSE clients for live push sync
 const sseClients: express.Response[] = [];
 
-// Initialize Gemini API client if API key is present
+// Initialize Gemini API client if API key is present (gemini-3.8-flash)
 let aiClient: GoogleGenAI | null = null;
 if (process.env.GEMINI_API_KEY) {
-  aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  console.log('[AI] Google Gemini client initialized with GEMINI_API_KEY');
+  aiClient = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build'
+      }
+    }
+  });
+  console.log('[AI] Google Gemini client initialized with model gemini-3.8-flash');
 }
 
 // Broadcast SSE Helper
@@ -181,43 +188,85 @@ app.post('/api/notifications/send-test', async (req, res) => {
   });
 });
 
-// AI Setup Analysis Route with Gemini API
+// UPGRADE MODULE 4 & 5: Schema-Validated Institutional Analysis with Gemini 3.8 Flash
 app.post('/api/ai/analyze-setup', async (req, res) => {
-  const { signal } = req.body;
+  const { signal, evidence } = req.body;
   if (!signal) {
     return res.status(400).json({ error: 'Missing signal in request body' });
   }
 
   if (aiClient) {
     try {
-      const prompt = `You are the lead quant risk officer at GREVIN AI.
-Analyze this verified institutional setup:
+      const prompt = `You are the chief quantitative risk officer and institutional mentor at GREVIN AI.
+Analyze this institutional trading setup using strict market auction theory and Smart Money Concepts (SMC):
 - Instrument: ${signal.symbol}
 - Direction: ${signal.direction}
 - Strategy: ${signal.strategyName}
 - Setup Grade: ${signal.grade}
 - Session: ${signal.session}
-- Entry: ${signal.entryPrice}
+- Entry Price: ${signal.entryPrice}
 - Stop Loss: ${signal.stopLoss}
-- Take Profit (2R): ${signal.tp}
-- Checklist: ${JSON.stringify(signal.checklist)}
+- Take Profit (2R Target): ${signal.tp}
+- Checklist: ${JSON.stringify(signal.checklist || [])}
+- Structured Evidence: ${JSON.stringify(evidence || {})}
 
-Provide a strict, professional institutional analysis covering:
-1. Session auction context (Value Area boundary or POC reaction).
-2. Structural verification (Break of Structure or failure of acceptance).
-3. Invalidation risk parameters (2R target expectancy).
-Keep under 140 words. No hype.`;
+Provide an authoritative institutional breakdown. Note that rule-based deterministic risk validation runs independently and cannot be overridden by AI opinions.`;
 
       const response = await aiClient.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
+        model: 'gemini-3.8-flash',
+        contents: prompt,
+        config: {
+          systemInstruction: 'You are an institutional quant analyst. Deliver concise, high-signal, zero-hype analysis in strict JSON.',
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              bias: { type: Type.STRING, description: 'BUY, SELL, or WAIT' },
+              confidenceScore: { type: Type.NUMBER, description: 'Confidence rating between 0 and 100' },
+              institutionalNarrative: { type: Type.STRING, description: 'Clear institutional order flow and auction theory thesis' },
+              orderFlowContext: { type: Type.STRING, description: 'POC, Value Area, Order Block, or FVG reaction context' },
+              keyLevelsToWatch: {
+                type: Type.OBJECT,
+                properties: {
+                  invalidationLevel: { type: Type.NUMBER, description: 'Structural invalidation price level' },
+                  targetLevel: { type: Type.NUMBER, description: 'Primary 2R or liquidity target price' }
+                },
+                required: ['invalidationLevel', 'targetLevel']
+              },
+              liquidityObjective: { type: Type.STRING, description: 'Specific buy-side or sell-side liquidity pool targeted' },
+              riskAssessment: { type: Type.STRING, description: 'Strict risk rules (stop >= 1x ATR14, 0.25R adverse invalidation)' }
+            },
+            required: ['bias', 'confidenceScore', 'institutionalNarrative', 'orderFlowContext', 'keyLevelsToWatch', 'liquidityObjective', 'riskAssessment']
+          }
+        }
       });
 
       if (response && response.text) {
-        return res.json({ analysis: response.text });
+        try {
+          const parsed = JSON.parse(response.text);
+          const formattedAnalysis = [
+            `**Institutional Narrative (${signal.symbol} — Grade ${signal.grade}):**`,
+            parsed.institutionalNarrative,
+            '',
+            `• **Order Flow Context:** ${parsed.orderFlowContext}`,
+            `• **Liquidity Objective:** ${parsed.liquidityObjective}`,
+            `• **Key Levels:** Invalidation at ${parsed.keyLevelsToWatch?.invalidationLevel || signal.stopLoss} | Target at ${parsed.keyLevelsToWatch?.targetLevel || signal.tp}`,
+            `• **Risk Assessment:** ${parsed.riskAssessment}`,
+            '',
+            `*Institutional Confidence: ${parsed.confidenceScore}% | Bias: ${parsed.bias}*`,
+            `*(Deterministic Risk Validation Rule: Independent engine stop parameters cannot be overridden by AI analysis)*`
+          ].join('\n');
+
+          return res.json({
+            analysis: formattedAnalysis,
+            structuredData: parsed
+          });
+        } catch (_) {
+          return res.json({ analysis: response.text });
+        }
       }
     } catch (err: any) {
-      console.warn('[AI] Gemini call failed:', err?.message);
+      console.warn('[AI] Gemini 3.8 Flash call failed:', err?.message);
       const isRateLimit = err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('RESOURCE_EXHAUSTED') || err?.message?.includes('quota');
       if (isRateLimit) {
         return res.status(429).json({
@@ -233,7 +282,8 @@ Keep under 140 words. No hype.`;
   const fallback = `**Institutional Analysis (${signal.symbol} — Grade ${signal.grade}):**\n` +
     `• **Auction Mechanics:** Setup triggered under ${signal.session} session liquidity.\n` +
     `• **Execution Verification:** Rules confirmed with entry at ${signal.entryPrice} and structural invalidation at ${signal.stopLoss}.\n` +
-    `• **Target Expectancy:** Fixed single target at 2.0R (${signal.tp}) aligned with positive mathematical expectancy.`;
+    `• **Target Expectancy:** Fixed single target at 2.0R (${signal.tp}) aligned with positive mathematical expectancy.\n` +
+    `*(Independent Risk Validation: Rule-based parameters strictly enforced)*`;
 
   res.json({ analysis: fallback });
 });

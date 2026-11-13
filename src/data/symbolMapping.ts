@@ -80,7 +80,7 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     lotStep: 0.01,
     currentBid: 0,
     currentAsk: 0,
-    spreadPips: 3.5,
+    spreadPips: 0,
     dayChangePercent: 0,
     dayHigh: 0,
     dayLow: 0,
@@ -109,7 +109,7 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     lotStep: 0.01,
     currentBid: 0,
     currentAsk: 0,
-    spreadPips: 1.5,
+    spreadPips: 0,
     dayChangePercent: 0,
     dayHigh: 0,
     dayLow: 0,
@@ -138,7 +138,7 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     lotStep: 0.01,
     currentBid: 0,
     currentAsk: 0,
-    spreadPips: 1.8,
+    spreadPips: 0,
     dayChangePercent: 0,
     dayHigh: 0,
     dayLow: 0,
@@ -167,7 +167,7 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     lotStep: 0.01,
     currentBid: 0,
     currentAsk: 0,
-    spreadPips: 1.5,
+    spreadPips: 0,
     dayChangePercent: 0,
     dayHigh: 0,
     dayLow: 0,
@@ -194,12 +194,12 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     minLot: 0.01,
     maxLot: 500.0,
     lotStep: 0.01,
-    currentBid: 585.50,
-    currentAsk: 585.60,
-    spreadPips: 1.0,
-    dayChangePercent: 0.45,
-    dayHigh: 588.0,
-    dayLow: 584.0,
+    currentBid: 0,
+    currentAsk: 0,
+    spreadPips: 0,
+    dayChangePercent: 0,
+    dayHigh: 0,
+    dayLow: 0,
     isAvailable: true,
     exchangeIsOpen: true,
     isTradingSuspended: false,
@@ -226,12 +226,12 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     minLot: 0.01,
     maxLot: 500.0,
     lotStep: 0.01,
-    currentBid: 495.20,
-    currentAsk: 495.30,
-    spreadPips: 1.0,
-    dayChangePercent: 0.62,
-    dayHigh: 498.0,
-    dayLow: 493.5,
+    currentBid: 0,
+    currentAsk: 0,
+    spreadPips: 0,
+    dayChangePercent: 0,
+    dayHigh: 0,
+    dayLow: 0,
     isAvailable: true,
     exchangeIsOpen: true,
     isTradingSuspended: false,
@@ -260,7 +260,7 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     lotStep: 0.1,
     currentBid: 0,
     currentAsk: 0,
-    spreadPips: 3.0,
+    spreadPips: 0,
     dayChangePercent: 0,
     dayHigh: 0,
     dayLow: 0,
@@ -287,12 +287,12 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     minLot: 0.001,
     maxLot: 10.0,
     lotStep: 0.001,
-    currentBid: 68420.00,
-    currentAsk: 68425.00,
-    spreadPips: 5.0,
-    dayChangePercent: 1.82,
-    dayHigh: 69200.0,
-    dayLow: 67100.0,
+    currentBid: 0,
+    currentAsk: 0,
+    spreadPips: 0,
+    dayChangePercent: 0,
+    dayHigh: 0,
+    dayLow: 0,
     isAvailable: true,
     exchangeIsOpen: true,
     isTradingSuspended: false,
@@ -316,12 +316,12 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     minLot: 0.01,
     maxLot: 500.0,
     lotStep: 0.01,
-    currentBid: 585.50,
-    currentAsk: 585.60,
-    spreadPips: 1.0,
-    dayChangePercent: 0.45,
-    dayHigh: 588.0,
-    dayLow: 584.0,
+    currentBid: 0,
+    currentAsk: 0,
+    spreadPips: 0,
+    dayChangePercent: 0,
+    dayHigh: 0,
+    dayLow: 0,
     isAvailable: true,
     exchangeIsOpen: true,
     isTradingSuspended: false,
@@ -347,12 +347,12 @@ export const DEFAULT_SYMBOL_REGISTRY: Record<string, SymbolInfo> = {
     minLot: 0.01,
     maxLot: 500.0,
     lotStep: 0.01,
-    currentBid: 495.20,
-    currentAsk: 495.30,
-    spreadPips: 1.0,
-    dayChangePercent: 0.62,
-    dayHigh: 498.0,
-    dayLow: 493.5,
+    currentBid: 0,
+    currentAsk: 0,
+    spreadPips: 0,
+    dayChangePercent: 0,
+    dayHigh: 0,
+    dayLow: 0,
     isAvailable: true,
     exchangeIsOpen: true,
     isTradingSuspended: false,
@@ -615,4 +615,42 @@ export function formatPrice(price: number, symbol: string, digits = 2): string {
 export function calculatePips(diff: number, pipSize: number): number {
   if (!pipSize || pipSize <= 0) return 0;
   return Number((Math.abs(diff) / pipSize).toFixed(1));
+}
+
+/**
+ * Requirement 1: Show the spread in price units for crypto, in pips only for forex and gold.
+ */
+export function formatSpread(diffOrPips: number, symbol: string, isAlreadyInPips = false, pipSize = 0.0001): string {
+  if (diffOrPips === undefined || diffOrPips === null || isNaN(diffOrPips) || diffOrPips <= 0) {
+    return 'N/A';
+  }
+  const norm = normalizeAllowedSymbol(symbol);
+  const isCrypto = norm === 'BTCUSD' || norm.includes('BTC') || symbol.toUpperCase().includes('BTC');
+
+  if (isCrypto) {
+    // Spread in price units (e.g. 0.50)
+    return diffOrPips.toFixed(2);
+  }
+
+  // Forex and Gold in pips
+  if (isAlreadyInPips) {
+    return `${diffOrPips.toFixed(1)} pips`;
+  }
+  const pips = pipSize > 0 ? diffOrPips / pipSize : diffOrPips;
+  return `${pips.toFixed(1)} pips`;
+}
+
+/**
+ * Requirement 2: Truthful labels: the footer STATUS, the "Profile: REAL" chip
+ * and the BID/ASK box must show NO DATA / N/A whenever there are no live candles or quotes.
+ */
+export function getTruthfulStatus(isOpen: boolean, hasData: boolean, isUnavailable = false): string {
+  if (isUnavailable) return 'UNAVAILABLE';
+  if (!hasData) return 'NO DATA';
+  return isOpen ? 'OPEN' : 'MARKET CLOSED';
+}
+
+export function getTruthfulProfileLabel(profileLabel: string | undefined, hasData: boolean): string {
+  if (!hasData) return 'NO DATA';
+  return profileLabel || 'NO DATA';
 }

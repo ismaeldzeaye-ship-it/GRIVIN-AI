@@ -4,7 +4,7 @@ import { calculateVolumeProfile, calculateTimeAtPriceProfile } from '../engine/v
 import { analyzeMarketStructure } from '../engine/structure';
 import { detectFairValueGaps, detectOrderBlocks } from '../engine/smc';
 import { getActiveSessionSchedules } from '../engine/sessions';
-import { SUPPORTED_SYMBOLS, formatPrice } from '../data/symbolMapping';
+import { SUPPORTED_SYMBOLS, formatPrice, formatSpread, getTruthfulStatus, getTruthfulProfileLabel } from '../data/symbolMapping';
 import { 
   Layers, 
   Eye, 
@@ -17,7 +17,12 @@ import {
   Activity,
   Crosshair,
   ShieldCheck,
-  X
+  X,
+  AlertTriangle,
+  RefreshCw,
+  Clock,
+  Terminal,
+  Radio
 } from 'lucide-react';
 
 interface ChartComponentProps {
@@ -31,6 +36,8 @@ interface ChartComponentProps {
   onClearAuditedSignal?: () => void;
   currentBid: number;
   currentAsk: number;
+  quoteTimestamp?: number;
+  quoteLastChanged?: number;
   isConnected: boolean;
   isSimulation: boolean;
   dataSource?: string;
@@ -42,6 +49,16 @@ interface ChartComponentProps {
   onBinanceMarketTypeChange?: (type: 'SPOT' | 'FUTURES') => void;
   isBlockedRegion?: boolean;
   provider?: 'DERIV' | 'BINANCE' | 'SIMULATION';
+  symbolDebugInfo?: {
+    lastRequestSent?: string;
+    lastResponseType?: string;
+    candleCount?: number;
+    lastCandleTime?: string | null;
+    errorMessage?: string | null;
+  };
+  binanceErrorMessage?: string | null;
+  derivErrorMessage?: string | null;
+  onRetryNow?: () => void;
 }
 
 export const ChartComponent: React.FC<ChartComponentProps> = ({
@@ -55,6 +72,8 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   onClearAuditedSignal,
   currentBid,
   currentAsk,
+  quoteTimestamp,
+  quoteLastChanged,
   isConnected,
   isSimulation,
   dataSource = 'Deriv',
@@ -65,7 +84,11 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   binanceMarketType = 'SPOT',
   onBinanceMarketTypeChange,
   isBlockedRegion = false,
-  provider = 'DERIV'
+  provider = 'DERIV',
+  symbolDebugInfo,
+  binanceErrorMessage,
+  derivErrorMessage,
+  onRetryNow
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 850, height: 500 });
@@ -75,6 +98,7 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
   const [showSessions, setShowSessions] = useState(true);
   const [showStructure, setShowStructure] = useState(true);
   const [showSMC, setShowSMC] = useState(true);
+  const [showMitigatedZones, setShowMitigatedZones] = useState(false);
   const [showEntrySLTP, setShowEntrySLTP] = useState(true);
   const [showCrosshair, setShowCrosshair] = useState(true);
   const [showOverlayMenu, setShowOverlayMenu] = useState(false);
@@ -154,13 +178,38 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
     return analyzeMarketStructure(visibleCandles, timeframe);
   }, [visibleCandles, timeframe]);
 
+  const currentPrice = visibleCandles.length > 0 ? visibleCandles[visibleCandles.length - 1].close : 0;
+  const latestCandleIdx = visibleCandles.length - 1;
+
   const fvgs = useMemo(() => {
-    return detectFairValueGaps(visibleCandles, timeframe);
-  }, [visibleCandles, timeframe]);
+    let list = detectFairValueGaps(visibleCandles, timeframe);
+    if (!showMitigatedZones) {
+      list = list.filter(f => f.mitigationStatus !== 'MITIGATED');
+      const scored = list.map(f => {
+        const mid = (f.top + f.bottom) / 2;
+        const dist = Math.abs(mid - currentPrice);
+        return { fvg: f, dist };
+      });
+      scored.sort((a, b) => a.dist - b.dist);
+      list = scored.slice(0, 3).map(s => s.fvg);
+    }
+    return list;
+  }, [visibleCandles, timeframe, showMitigatedZones, currentPrice]);
 
   const orderBlocks = useMemo(() => {
-    return detectOrderBlocks(visibleCandles, timeframe);
-  }, [visibleCandles, timeframe]);
+    let list = detectOrderBlocks(visibleCandles, timeframe);
+    if (!showMitigatedZones) {
+      list = list.filter(ob => ob.mitigationStatus !== 'MITIGATED');
+      const scored = list.map(ob => {
+        const mid = (ob.top + ob.bottom) / 2;
+        const dist = Math.abs(mid - currentPrice);
+        return { ob, dist };
+      });
+      scored.sort((a, b) => a.dist - b.dist);
+      list = scored.slice(0, 3).map(s => s.ob);
+    }
+    return list;
+  }, [visibleCandles, timeframe, showMitigatedZones, currentPrice]);
 
   // Chart coordinate math
   const paddingRight = 95; // Dedicated right edge space for Entry/SL/TP labels & price scale
@@ -170,8 +219,57 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
 
   const chartWidth = Math.max(200, dimensions.width - paddingLeft - paddingRight);
   const chartHeight = Math.max(200, dimensions.height - paddingTop - paddingBottom);
-
   const hasCandles = visibleCandles.length > 0;
+
+  // Real-time quote freshness & staleness tracking (Requirement 1)
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const hasLiveQuote = currentBid > 0 && currentAsk > 0 && Boolean(quoteTimestamp && quoteTimestamp > 0);
+  const quoteAgeSec = hasLiveQuote && quoteTimestamp ? Math.max(0, Math.floor((now - quoteTimestamp) / 1000)) : null;
+  const isQuoteGreyedOut = quoteAgeSec !== null && quoteAgeSec > 15;
+  const quoteUnchangedSec = hasLiveQuote && (quoteLastChanged || quoteTimestamp)
+    ? Math.max(0, Math.floor((now - (quoteLastChanged || quoteTimestamp!)) / 1000))
+    : 0;
+  const isQuoteStale = isMarketOpen && quoteUnchangedSec >= 60;
+  const liveSpreadFormatted = hasLiveQuote
+    ? formatSpread(Math.max(0, currentAsk - currentBid), symbol, false, symInfo?.pipSize || 0.0001)
+    : 'N/A';
+
+  // Empty chart backoff retry countdown (Requirement 3)
+  const [retryCountdown, setRetryCountdown] = useState(10);
+  useEffect(() => {
+    if (hasCandles || isSimulation) return;
+    const t = setInterval(() => {
+      setRetryCountdown((prev) => {
+        if (prev <= 1) {
+          if (onRetryNow) onRetryNow();
+          return 15;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [hasCandles, isSimulation, onRetryNow]);
+
+  // M10 / M45 synthesis status tracking (Requirement 5)
+  const isSynthesizedTimeframe = timeframe === '10m' || timeframe === '45m';
+  const synthesisLabel = useMemo(() => {
+    if (timeframe === '10m') {
+      return hasCandles
+        ? `M10 Synthesis: ACTIVE (Built from 2 closed M5 candles) • Complete bars: ${candles.length}`
+        : `M10 Synthesis: BLOCKED — Source M5 candles missing or incomplete`;
+    }
+    if (timeframe === '45m') {
+      return hasCandles
+        ? `M45 Synthesis: ACTIVE (Built from 3 closed M15 candles) • Complete bars: ${candles.length}`
+        : `M45 Synthesis: BLOCKED — Source M15 candles missing or incomplete`;
+    }
+    return null;
+  }, [timeframe, hasCandles, candles.length]);
 
   const { minPrice, maxPrice, priceRange } = useMemo(() => {
     if (!hasCandles) return { minPrice: 0, maxPrice: 0, priceRange: 0 };
@@ -394,19 +492,35 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
           </div>
         </div>
 
-        {/* Live Spread & Bid/Ask Pill */}
-        <div className="hidden sm:flex items-center gap-3 text-xs font-mono">
+        {/* Live Spread & Bid/Ask Pill (Requirement 1 & 2: Real live quote, 15s grey-out, 60s stale, crypto in price units, N/A when no live quote) */}
+        <div className={`hidden sm:flex items-center gap-2.5 text-xs font-mono transition-opacity ${
+          isQuoteGreyedOut ? 'opacity-40' : ''
+        }`}>
           <div className="flex items-center gap-1.5 text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800">
             <span>BID</span>
-            <span className="text-emerald-400 font-bold">{formatPrice(currentBid, symbol)}</span>
+            <span className={hasLiveQuote ? (isQuoteGreyedOut ? 'text-slate-400 font-bold' : 'text-emerald-400 font-bold') : 'text-slate-500 font-bold'}>
+              {hasLiveQuote ? formatPrice(currentBid, symbol) : 'N/A'}
+            </span>
           </div>
           <div className="flex items-center gap-1.5 text-slate-400 bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800">
             <span>ASK</span>
-            <span className="text-rose-400 font-bold">{formatPrice(currentAsk, symbol)}</span>
+            <span className={hasLiveQuote ? (isQuoteGreyedOut ? 'text-slate-400 font-bold' : 'text-rose-400 font-bold') : 'text-slate-500 font-bold'}>
+              {hasLiveQuote ? formatPrice(currentAsk, symbol) : 'N/A'}
+            </span>
           </div>
           <div className="text-[11px] text-slate-400">
-            Spread: <span className="text-amber-300 font-bold">{symInfo.spreadPips} pips</span>
+            Spread: <span className="text-amber-300 font-bold">{liveSpreadFormatted}</span>
           </div>
+          {hasLiveQuote && quoteAgeSec !== null && (
+            <div className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+              {quoteAgeSec}s ago
+            </div>
+          )}
+          {isQuoteStale && (
+            <div className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-500/40 font-bold animate-pulse">
+              STALE QUOTE (&gt;60s)
+            </div>
+          )}
         </div>
 
         {/* Overlay Controls & Zoom */}
@@ -508,6 +622,18 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
                 />
               </label>
 
+              <label className="flex items-center justify-between p-1.5 hover:bg-slate-800/50 rounded cursor-pointer pl-6">
+                <span className="text-slate-400 flex items-center gap-2 text-[11px]">
+                  <span>Show mitigated / historical zones</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={showMitigatedZones}
+                  onChange={(e) => setShowMitigatedZones(e.target.checked)}
+                  className="rounded bg-slate-800 border-slate-700 text-cyan-500 focus:ring-0"
+                />
+              </label>
+
               <label className="flex items-center justify-between p-1.5 hover:bg-slate-800/50 rounded cursor-pointer">
                 <span className="text-slate-300 flex items-center gap-2">
                   <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 inline-block"></span>
@@ -578,6 +704,23 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
                 <span>Exit Audit</span>
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Requirement 5: M10 and M45 Synthesis Status Banner */}
+      {isSynthesizedTimeframe && (
+        <div className={`p-2.5 rounded-xl border flex flex-wrap items-center justify-between gap-2 text-xs font-mono shadow-sm ${
+          hasCandles
+            ? 'bg-cyan-950/60 border-cyan-500/30 text-cyan-300'
+            : 'bg-amber-950/60 border-amber-500/40 text-amber-300'
+        }`}>
+          <div className="flex items-center gap-2">
+            <span className={`w-2.5 h-2.5 rounded-full ${hasCandles ? 'bg-cyan-400 animate-pulse' : 'bg-amber-400'}`}></span>
+            <span className="font-bold">{synthesisLabel}</span>
+          </div>
+          <div className="text-[11px] text-slate-400">
+            {timeframe === '10m' ? '2 contiguous closed M5 candles required per M10 bar' : '3 contiguous closed M15 candles required per M45 bar'} • UTC Aligned
           </div>
         </div>
       )}
@@ -700,14 +843,18 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             const yBottom = priceToY(fvg.bottom);
             const height = Math.abs(yBottom - yTop);
             const x = candleToX(Math.max(0, fvg.candleIndex));
+            const isOld = latestCandleIdx - fvg.candleIndex > 200;
+            const fill = fvg.direction === 'BULLISH'
+              ? (isOld ? 'rgba(16, 185, 129, 0.03)' : 'rgba(16, 185, 129, 0.12)')
+              : (isOld ? 'rgba(244, 63, 94, 0.03)' : 'rgba(244, 63, 94, 0.12)');
             return (
-              <g key={fvg.id}>
+              <g key={fvg.id} opacity={isOld ? 0.35 : 1.0}>
                 <rect
                   x={x}
                   y={Math.min(yTop, yBottom)}
                   width={chartWidth + paddingLeft - x}
                   height={Math.max(2, height)}
-                  fill={fvg.direction === 'BULLISH' ? 'rgba(16, 185, 129, 0.12)' : 'rgba(244, 63, 94, 0.12)'}
+                  fill={fill}
                   stroke={fvg.direction === 'BULLISH' ? '#10b981' : '#f43f5e'}
                   strokeWidth="1"
                   strokeDasharray="2 2"
@@ -731,14 +878,18 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             const yBottom = priceToY(ob.bottom);
             const height = Math.abs(yBottom - yTop);
             const x = candleToX(Math.max(0, ob.candleIndex));
+            const isOld = latestCandleIdx - ob.candleIndex > 200;
+            const fill = ob.direction === 'BULLISH'
+              ? (isOld ? 'rgba(56, 189, 248, 0.04)' : 'rgba(56, 189, 248, 0.14)')
+              : (isOld ? 'rgba(234, 179, 8, 0.04)' : 'rgba(234, 179, 8, 0.14)');
             return (
-              <g key={ob.id}>
+              <g key={ob.id} opacity={isOld ? 0.35 : 1.0}>
                 <rect
                   x={x}
                   y={Math.min(yTop, yBottom)}
                   width={chartWidth + paddingLeft - x}
                   height={Math.max(3, height)}
-                  fill={ob.direction === 'BULLISH' ? 'rgba(56, 189, 248, 0.14)' : 'rgba(234, 179, 8, 0.14)'}
+                  fill={fill}
                   stroke={ob.direction === 'BULLISH' ? '#38bdf8' : '#eab308'}
                   strokeWidth="1"
                 />
@@ -1232,41 +1383,16 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             </g>
           )}
 
-          {/* Empty Chart Canvas State (Requirement 6: When there are no candles, show "No data" instead of a fake axis) */}
+          {/* Empty Chart Canvas Background */}
           {!hasCandles && (
-            <g>
-              <rect
-                x={paddingLeft}
-                y={paddingTop}
-                width={chartWidth}
-                height={chartHeight}
-                fill="#070a12"
-                fillOpacity="0.4"
-              />
-              <text
-                x={paddingLeft + chartWidth / 2}
-                y={paddingTop + chartHeight / 2 - 10}
-                fill="#64748b"
-                fontSize="14"
-                fontWeight="bold"
-                textAnchor="middle"
-                fontFamily="monospace"
-              >
-                No candle data available
-              </text>
-              <text
-                x={paddingLeft + chartWidth / 2}
-                y={paddingTop + chartHeight / 2 + 14}
-                fill="#475569"
-                fontSize="11"
-                textAnchor="middle"
-                fontFamily="monospace"
-              >
-                {!isMarketOpen
-                  ? 'MARKET CLOSED — Awaiting closed session history from Deriv'
-                  : 'Connecting to market data feed...'}
-              </text>
-            </g>
+            <rect
+              x={paddingLeft}
+              y={paddingTop}
+              width={chartWidth}
+              height={chartHeight}
+              fill="#070a12"
+              fillOpacity="0.5"
+            />
           )}
         </svg>
 
@@ -1382,7 +1508,8 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
         </div>
 
         {/* Disconnected Overlay */}
-        {!isConnected && !isSimulation && !isBlockedRegion && (
+        {/* Disconnected Overlay (When not connected and not simulation) */}
+        {!isConnected && !isSimulation && !isBlockedRegion && hasCandles && (
           <div className="absolute inset-0 z-30 bg-[#090d16]/90 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
             <div className="p-3 rounded-full bg-slate-900 border border-slate-800 text-slate-500 mb-2">
               <Activity className="w-6 h-6 text-rose-400" />
@@ -1394,16 +1521,103 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
           </div>
         )}
 
-        {/* Binance HTTP 451 Regional Block Overlay (Requirement 7) */}
-        {isBlockedRegion && (
-          <div className="absolute inset-0 z-35 bg-[#090d16]/95 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
-            <div className="p-3 rounded-full bg-rose-950/80 border border-rose-500/50 text-rose-400 mb-2">
-              <Activity className="w-6 h-6 text-rose-400" />
+        {/* Requirement 3 & 4: Truthful Empty Chart Diagnostics with Backoff, Errors, and Region Block Notice */}
+        {!hasCandles && !isSimulation && (
+          <div className="absolute inset-0 bg-[#070b14]/92 backdrop-blur-sm z-30 flex items-center justify-center p-4">
+            <div className="max-w-xl w-full bg-[#0b0f19] border border-slate-700/80 rounded-2xl p-5 shadow-2xl font-mono space-y-4">
+              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                <div className="flex items-center gap-2 text-amber-400 font-bold text-xs uppercase tracking-wider">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Market Data Feed Diagnostics</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-slate-300 bg-slate-900 px-2 py-0.5 rounded border border-slate-800 font-bold">
+                    {provider}
+                  </span>
+                  <span className="text-[10px] text-cyan-400 bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-500/30 font-bold">
+                    {timeframe}
+                  </span>
+                </div>
+              </div>
+
+              {/* Real reason breakdown */}
+              <div className="space-y-2 text-xs">
+                <div className="grid grid-cols-3 gap-2 p-2 bg-[#050811] rounded-lg border border-slate-800/80 text-[11px]">
+                  <div>
+                    <span className="text-slate-500 block">Symbol:</span>
+                    <span className="text-slate-200 font-bold">{symbol}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block">Broker Symbol:</span>
+                    <span className="text-slate-300">{exactBrokerSymbol || symbol}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block">Market Status:</span>
+                    <span className={isMarketOpen ? 'text-emerald-400 font-bold' : 'text-amber-400 font-bold'}>
+                      {isMarketOpen ? 'OPEN' : 'MARKET CLOSED'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="p-2.5 bg-[#050811] rounded-lg border border-slate-800/80 space-y-1">
+                  <div className="text-slate-500 text-[10.5px]">Last Request Sent:</div>
+                  <div className="text-slate-300 font-mono text-[11px] break-all">
+                    {symbolDebugInfo?.lastRequestSent || (provider === 'BINANCE' 
+                      ? `${binanceMarketType === 'SPOT' ? 'https://data-api.binance.vision/api/v3/klines' : 'https://fapi.binance.com/fapi/v1/klines'}?symbol=${symbol.replace('/', '')}&interval=${timeframe}`
+                      : `ticks_history: ${exactBrokerSymbol || symbol}, style: candles, count: 1000, granularity: ${timeframe}`)}
+                  </div>
+                </div>
+
+                <div className="p-2.5 bg-[#050811] rounded-lg border border-slate-800/80 space-y-1">
+                  <div className="text-slate-500 text-[10.5px]">Full Response / Error Details:</div>
+                  <div className="text-rose-300 font-mono text-[11px] break-all">
+                    {isBlockedRegion || binanceErrorMessage?.includes('451')
+                      ? 'Binance Futures blocked in this server region (HTTP 451)'
+                      : derivErrorMessage
+                      ? derivErrorMessage
+                      : symbolDebugInfo?.errorMessage
+                      ? symbolDebugInfo.errorMessage
+                      : !isMarketOpen
+                      ? 'Market is currently closed for weekend or broker trading suspension. Closed session history pending.'
+                      : isSynthesizedTimeframe && candles.length === 0
+                      ? `${timeframe} requires complete contiguous closed source candles (${timeframe === '10m' ? 'M5' : 'M15'}). Source candles missing or awaiting completion.`
+                      : 'Connecting to WebSocket stream and awaiting live candle delivery.'}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1">
+                  <div className="flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-slate-500" />
+                    <span>Last Attempt: {new Date(now).toISOString().substring(11, 19)} UTC</span>
+                  </div>
+                  <div className="text-cyan-400 font-bold">
+                    Next retry in {retryCountdown}s
+                  </div>
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                {(isBlockedRegion || binanceErrorMessage?.includes('451')) && onBinanceMarketTypeChange && (
+                  <button
+                    onClick={() => onBinanceMarketTypeChange('SPOT')}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-500/40 text-xs font-bold hover:bg-emerald-900 transition flex items-center gap-1.5"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Switch to Binance Spot for BTC</span>
+                  </button>
+                )}
+                {onRetryNow && (
+                  <button
+                    onClick={onRetryNow}
+                    className="ml-auto px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600 text-xs font-bold transition flex items-center gap-1.5"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-slate-400" />
+                    <span>Retry Now</span>
+                  </button>
+                )}
+              </div>
             </div>
-            <h3 className="text-sm font-bold text-rose-300 font-mono">Binance blocked in this server region</h3>
-            <p className="text-xs text-slate-400 max-w-md mt-1">
-              Binance returned HTTP 451 (regional block). No simulated data is substituted to prevent inaccurate signal generation.
-            </p>
           </div>
         )}
 
@@ -1411,7 +1625,7 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
         {showVolumeProfile && (
           <div className="absolute top-12 left-4 z-20 flex items-center gap-1.5 bg-slate-950/90 border border-slate-700 text-slate-300 text-xs px-3 py-1.5 rounded-lg shadow-lg font-mono">
             <span className={`w-2 h-2 rounded-full ${isBinance ? 'bg-emerald-400' : 'bg-cyan-400'}`}></span>
-            <span>Profile: {volumeProfile.label}</span>
+            <span>Profile: {getTruthfulProfileLabel(volumeProfile.label, hasCandles)}</span>
           </div>
         )}
 
@@ -1433,7 +1647,7 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
 
         {/* Hovered Candle Floating Inspector Badge */}
         {hoveredCandle && (
-          <div className="absolute top-2 left-4 z-20 flex items-center gap-3 bg-slate-900/90 backdrop-blur px-3 py-1.5 rounded-lg border border-slate-800 text-xs font-mono text-slate-300 shadow-xl">
+          <div className="absolute top-2 left-4 z-20 flex flex-wrap items-center gap-3 bg-slate-900/90 backdrop-blur px-3 py-1.5 rounded-lg border border-slate-800 text-xs font-mono text-slate-300 shadow-xl">
             <span className="text-slate-400">
               {new Date(hoveredCandle.time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
             </span>
@@ -1444,6 +1658,11 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
             <span className="text-slate-400">
               Vol: <strong>{hoveredCandle.volume ? hoveredCandle.volume.toLocaleString() : 'NONE'}</strong>
             </span>
+            {hoveredCandle.sourceCandleTimes && hoveredCandle.sourceCandleTimes.length > 0 && (
+              <span className="text-[10.5px] px-2 py-0.5 rounded bg-cyan-950/80 text-cyan-300 font-bold border border-cyan-500/30">
+                Source: [{hoveredCandle.sourceCandleTimes.map(t => new Date(t * 1000).toISOString().substring(11, 16)).join(', ')} UTC]
+              </span>
+            )}
             {hoveredCandle.isOffHours && (
               <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30 text-[10px]">
                 OFF-HOURS
@@ -1477,13 +1696,15 @@ export const ChartComponent: React.FC<ChartComponentProps> = ({
           </span>
           <span className="text-slate-500">|</span>
           <span>
-            VOLUME: <strong className={volumeType === 'NONE' ? 'text-amber-300' : 'text-emerald-400'}>
-              {volumeType === 'REAL_VOLUME' ? 'REAL (Binance trade execution)' : volumeType}
+            VOLUME: <strong className={!hasCandles ? 'text-slate-500' : volumeType === 'NONE' ? 'text-amber-300' : 'text-emerald-400'}>
+              {!hasCandles ? 'NO DATA' : volumeType === 'REAL_VOLUME' ? 'REAL (Binance trade execution)' : volumeType}
             </strong>
           </span>
           <span className="text-slate-500">|</span>
           <span>
-            STATUS: <strong className={isMarketOpen ? 'text-emerald-400' : 'text-amber-300'}>{isMarketOpen ? 'OPEN' : 'MARKET CLOSED'}</strong>
+            STATUS: <strong className={!hasCandles && currentBid === 0 ? 'text-slate-500' : isMarketOpen ? 'text-emerald-400' : 'text-amber-300'}>
+              {getTruthfulStatus(isMarketOpen, hasCandles || currentBid > 0, !symInfo?.isAvailable)}
+            </strong>
           </span>
           {formingCandle && isMarketOpen && (
             <>

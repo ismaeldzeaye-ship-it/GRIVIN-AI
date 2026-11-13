@@ -136,3 +136,185 @@ export function synthesizeM45FromM15(
 
   return result;
 }
+
+/**
+ * Builds UTC-aligned H1 candles from 4 contiguous closed M15 candles.
+ * Hourly boundary: bucket start is Math.floor(time / 3600) * 3600 (:00 UTC).
+ */
+export function synthesizeH1FromM15(
+  m15Candles: Candle[],
+  symbol?: string,
+  provider?: DataSourceOrigin
+): Candle[] {
+  if (!m15Candles || m15Candles.length < 4) return [];
+
+  const closedOnly = m15Candles
+    .filter(c => !c.isForming)
+    .sort((a, b) => a.time - b.time);
+
+  const buckets = new Map<number, Candle[]>();
+  for (const c of closedOnly) {
+    const bucketStart = Math.floor(c.time / 3600) * 3600;
+    const existing = buckets.get(bucketStart) || [];
+    existing.push(c);
+    buckets.set(bucketStart, existing);
+  }
+
+  const result: Candle[] = [];
+  const sortedBucketStarts = Array.from(buckets.keys()).sort((a, b) => a - b);
+
+  for (const bucketStart of sortedBucketStarts) {
+    const list = buckets.get(bucketStart)!;
+    const c1 = list.find(c => c.time === bucketStart);
+    const c2 = list.find(c => c.time === bucketStart + 900);
+    const c3 = list.find(c => c.time === bucketStart + 1800);
+    const c4 = list.find(c => c.time === bucketStart + 2700);
+
+    // Require all 4 closed M15 bars
+    if (!c1 || !c2 || !c3 || !c4) continue;
+
+    const totalVolume = (c1.volume || 0) + (c2.volume || 0) + (c3.volume || 0) + (c4.volume || 0);
+    const totalBuyVol = (c1.buyVolume || 0) + (c2.buyVolume || 0) + (c3.buyVolume || 0) + (c4.buyVolume || 0);
+    const totalSellVol = (c1.sellVolume || 0) + (c2.sellVolume || 0) + (c3.sellVolume || 0) + (c4.sellVolume || 0);
+    const isOffHours = Boolean(c1.isOffHours && c2.isOffHours && c3.isOffHours && c4.isOffHours);
+
+    result.push({
+      time: bucketStart,
+      open: c1.open,
+      high: Math.max(c1.high, c2.high, c3.high, c4.high),
+      low: Math.min(c1.low, c2.low, c3.low, c4.low),
+      close: c4.close,
+      volume: totalVolume,
+      buyVolume: totalBuyVol,
+      sellVolume: totalSellVol,
+      isForming: false,
+      isOffHours,
+      sourceCandleTimes: [c1.time, c2.time, c3.time, c4.time],
+      sourceDescription: `H1 synthesized from 4 M15 candles [${symbol || 'Unknown'} / ${provider || 'Single Source'}]`
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Builds UTC-aligned H4 candles from 4 contiguous closed H1 candles.
+ * 4-Hour boundary: bucket start is Math.floor(time / 14400) * 14400 (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC).
+ */
+export function synthesizeH4FromH1(
+  h1Candles: Candle[],
+  symbol?: string,
+  provider?: DataSourceOrigin
+): Candle[] {
+  if (!h1Candles || h1Candles.length < 4) return [];
+
+  const closedOnly = h1Candles
+    .filter(c => !c.isForming)
+    .sort((a, b) => a.time - b.time);
+
+  const buckets = new Map<number, Candle[]>();
+  for (const c of closedOnly) {
+    const bucketStart = Math.floor(c.time / 14400) * 14400;
+    const existing = buckets.get(bucketStart) || [];
+    existing.push(c);
+    buckets.set(bucketStart, existing);
+  }
+
+  const result: Candle[] = [];
+  const sortedBucketStarts = Array.from(buckets.keys()).sort((a, b) => a - b);
+
+  for (const bucketStart of sortedBucketStarts) {
+    const list = buckets.get(bucketStart)!;
+    const c1 = list.find(c => c.time === bucketStart);
+    const c2 = list.find(c => c.time === bucketStart + 3600);
+    const c3 = list.find(c => c.time === bucketStart + 7200);
+    const c4 = list.find(c => c.time === bucketStart + 10800);
+
+    if (!c1 || !c2 || !c3 || !c4) continue;
+
+    const totalVolume = (c1.volume || 0) + (c2.volume || 0) + (c3.volume || 0) + (c4.volume || 0);
+    const totalBuyVol = (c1.buyVolume || 0) + (c2.buyVolume || 0) + (c3.buyVolume || 0) + (c4.buyVolume || 0);
+    const totalSellVol = (c1.sellVolume || 0) + (c2.sellVolume || 0) + (c3.sellVolume || 0) + (c4.sellVolume || 0);
+    const isOffHours = Boolean(c1.isOffHours && c2.isOffHours && c3.isOffHours && c4.isOffHours);
+
+    result.push({
+      time: bucketStart,
+      open: c1.open,
+      high: Math.max(c1.high, c2.high, c3.high, c4.high),
+      low: Math.min(c1.low, c2.low, c3.low, c4.low),
+      close: c4.close,
+      volume: totalVolume,
+      buyVolume: totalBuyVol,
+      sellVolume: totalSellVol,
+      isForming: false,
+      isOffHours,
+      sourceCandleTimes: [c1.time, c2.time, c3.time, c4.time],
+      sourceDescription: `H4 synthesized from 4 H1 candles [${symbol || 'Unknown'} / ${provider || 'Single Source'}]`
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Multi-timeframe trend and structure confluence across H4, H1, M15, M5 (Module 6).
+ */
+export function buildMultiTimeframeContext(candlesMap: {
+  M1?: Candle[];
+  M5?: Candle[];
+  M15?: Candle[];
+  H1?: Candle[];
+  H4?: Candle[];
+}): {
+  h4Trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  h1Trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  m15Trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  m5Trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  higherTimeframeBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  confluenceScore: number; // 0 to 100
+} {
+  const getTrend = (candles?: Candle[]): 'BULLISH' | 'BEARISH' | 'NEUTRAL' => {
+    if (!candles || candles.length < 5) return 'NEUTRAL';
+    const recent = candles.slice(-5);
+    const first = recent[0].close;
+    const last = recent[recent.length - 1].close;
+    if (last > first * 1.0005) return 'BULLISH';
+    if (last < first * 0.9995) return 'BEARISH';
+    return 'NEUTRAL';
+  };
+
+  const h4Trend = getTrend(candlesMap.H4);
+  const h1Trend = getTrend(candlesMap.H1);
+  const m15Trend = getTrend(candlesMap.M15);
+  const m5Trend = getTrend(candlesMap.M5);
+
+  let bullishVotes = 0;
+  let bearishVotes = 0;
+
+  if (h4Trend === 'BULLISH') bullishVotes += 2;
+  if (h4Trend === 'BEARISH') bearishVotes += 2;
+  if (h1Trend === 'BULLISH') bullishVotes += 2;
+  if (h1Trend === 'BEARISH') bearishVotes += 2;
+  if (m15Trend === 'BULLISH') bullishVotes += 1;
+  if (m15Trend === 'BEARISH') bearishVotes += 1;
+  if (m5Trend === 'BULLISH') bullishVotes += 1;
+  if (m5Trend === 'BEARISH') bearishVotes += 1;
+
+  let higherTimeframeBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+  if (bullishVotes > bearishVotes && bullishVotes >= 3) higherTimeframeBias = 'BULLISH';
+  else if (bearishVotes > bullishVotes && bearishVotes >= 3) higherTimeframeBias = 'BEARISH';
+
+  const maxPossible = 6;
+  const leadVotes = Math.max(bullishVotes, bearishVotes);
+  const confluenceScore = Math.round((leadVotes / maxPossible) * 100);
+
+  return {
+    h4Trend,
+    h1Trend,
+    m15Trend,
+    m5Trend,
+    higherTimeframeBias,
+    confluenceScore
+  };
+}
+

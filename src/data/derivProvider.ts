@@ -21,6 +21,14 @@ export type OnDataProofCallback = (
 
 export type OnRateLimitCallback = (rateLimit: RateLimitState) => void;
 
+export type OnDerivQuoteCallback = (
+  symbol: string,
+  bid: number,
+  ask: number,
+  timestampMs: number,
+  lastChangedMs: number
+) => void;
+
 interface SubscriptionInfo {
   timeframe: Timeframe;
   granularity: number;
@@ -105,19 +113,27 @@ export class DerivMarketDataProvider {
   private onActiveSymbolsDiscovered: OnActiveSymbolsCallback | null = null;
   private onDataProofUpdated: OnDataProofCallback | null = null;
   private onRateLimitChanged: OnRateLimitCallback | null = null;
+  private onQuoteUpdated: OnDerivQuoteCallback | null = null;
+  private liveQuotesMap: Record<string, { bid: number; ask: number; timestamp: number; lastChanged: number }> = {};
 
   constructor(
     onStatus?: OnStatusChangeCallback,
     onCandles?: OnCandlesCallback,
     onSymbols?: OnActiveSymbolsCallback,
     onDataProof?: OnDataProofCallback,
-    onRateLimit?: OnRateLimitCallback
+    onRateLimit?: OnRateLimitCallback,
+    onQuote?: OnDerivQuoteCallback
   ) {
     if (onStatus) this.onStatusChanged = onStatus;
     if (onCandles) this.onCandlesUpdated = onCandles;
     if (onSymbols) this.onActiveSymbolsDiscovered = onSymbols;
     if (onDataProof) this.onDataProofUpdated = onDataProof;
     if (onRateLimit) this.onRateLimitChanged = onRateLimit;
+    if (onQuote) this.onQuoteUpdated = onQuote;
+  }
+
+  public setOnQuoteCallback(cb: OnDerivQuoteCallback): void {
+    this.onQuoteUpdated = cb;
   }
 
   public getState(): DerivConnectionState {
@@ -591,6 +607,13 @@ export class DerivMarketDataProvider {
       subscribe: 1,
       req_id: ++this.reqId
     });
+
+    // Requirement 1: Subscribe to live tick stream for genuine real-time bid & ask
+    this.enqueueRequest({
+      ticks: cleanSym,
+      subscribe: 1,
+      req_id: ++this.reqId
+    });
   }
 
   private reSubscribeAll(): void {
@@ -613,6 +636,49 @@ export class DerivMarketDataProvider {
     // Ping response
     if (msg.msg_type === 'ping') {
       this.state.lastHeartbeat = Date.now();
+      return;
+    }
+
+    // Requirement 1: Genuine Deriv tick stream handling for BID/ASK
+    if (msg.msg_type === 'tick' && msg.tick) {
+      const tick = msg.tick;
+      const derivSym = tick.symbol;
+      const targetSymbol = this.findTargetSymbolByDerivSymbol(derivSym);
+      if (targetSymbol) {
+        const bid = Number(tick.bid ?? tick.quote);
+        const ask = Number(tick.ask ?? tick.quote);
+        const now = Date.now();
+        const prev = this.liveQuotesMap[targetSymbol];
+        let lastChanged = now;
+        if (prev && prev.bid === bid && prev.ask === ask) {
+          lastChanged = prev.lastChanged || now;
+        }
+        this.liveQuotesMap[targetSymbol] = { bid, ask, timestamp: now, lastChanged };
+
+        if (!this.dataProofMap[targetSymbol]) {
+          this.dataProofMap[targetSymbol] = {
+            symbol: targetSymbol,
+            underlyingSymbol: derivSym,
+            provider: 'DERIV',
+            lastTickPrice: bid,
+            lastTickTimeUtc: new Date(now).toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
+            lastTickEpoch: now,
+            ageSeconds: 0,
+            ticksReceivedSinceLoad: 1,
+            lastCandleTimePerTimeframe: {},
+            dataSourceType: 'LIVE_PROVEN'
+          };
+        } else {
+          this.dataProofMap[targetSymbol].lastTickPrice = bid;
+          this.dataProofMap[targetSymbol].lastTickEpoch = now;
+          this.dataProofMap[targetSymbol].lastTickTimeUtc = new Date(now).toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+          this.dataProofMap[targetSymbol].ticksReceivedSinceLoad = (this.dataProofMap[targetSymbol].ticksReceivedSinceLoad || 0) + 1;
+        }
+
+        if (this.onQuoteUpdated) {
+          this.onQuoteUpdated(targetSymbol, bid, ask, now, lastChanged);
+        }
+      }
       return;
     }
 

@@ -32,6 +32,7 @@ import {
   recordSignalToForwardTest, 
   resolveForwardTestTrades 
 } from './engine/forwardTest';
+import { logSignalFire, resolveOpenSignalLogs } from './engine/signalLogStore';
 import { 
   DEFAULT_NOTIFICATION_CONTROLS, 
   registerServiceWorker, 
@@ -77,13 +78,15 @@ export default function App() {
   // Forming candle (current incomplete candle rendered separately)
   const [formingCandlesMap, setFormingCandlesMap] = useState<Record<string, Candle | null>>({});
 
-  // Real-time Live Prices
-  const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number }>>(() => {
-    const init: Record<string, { bid: number; ask: number }> = {};
+  // Real-time Live Prices (Zero hardcoded prices — quotes come only from live providers)
+  const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; timestamp?: number; lastChanged?: number }>>(() => {
+    const init: Record<string, { bid: number; ask: number; timestamp?: number; lastChanged?: number }> = {};
     for (const sym of Object.keys(DEFAULT_SYMBOL_REGISTRY)) {
       init[sym] = {
-        bid: DEFAULT_SYMBOL_REGISTRY[sym].currentBid,
-        ask: DEFAULT_SYMBOL_REGISTRY[sym].currentAsk
+        bid: 0,
+        ask: 0,
+        timestamp: 0,
+        lastChanged: 0
       };
     }
     return init;
@@ -219,8 +222,12 @@ export default function App() {
             }
           );
 
+          // Resolve open signal logs against closed candles
+          resolveOpenSignalLogs(closedCandles, sym).catch(() => {});
+
           const validSig = newSignals.find(s => s.status === 'VALID' && (s.grade === 'A' || s.grade === 'B'));
           if (validSig) {
+            logSignalFire(validSig).catch(() => {});
             const notif = formatSignalNotification(validSig);
             if (shouldSendNotification(notif, notificationControls)) {
               dispatchNotification(notif, notificationControls);
@@ -236,12 +243,14 @@ export default function App() {
       (symbols) => {
         setSymbolRegistry((prev) => {
           const updated = applyDerivActiveSymbols(prev, symbols);
-          // Subscribe to all available Deriv symbols
-          for (const [k, v] of Object.entries(updated)) {
-            if (v.provider === 'DERIV' && v.isAvailable && v.exactBrokerSymbol && v.exactBrokerSymbol !== 'unavailable') {
-              derivProvider.subscribeCandles(k, v.exactBrokerSymbol, selectedTimeframe);
+          // Defer subscription outside React updater pass to prevent setState in render warnings
+          setTimeout(() => {
+            for (const [k, v] of Object.entries(updated)) {
+              if (v.provider === 'DERIV' && v.isAvailable && v.exactBrokerSymbol && v.exactBrokerSymbol !== 'unavailable') {
+                derivProvider.subscribeCandles(k, v.exactBrokerSymbol, selectedTimeframe);
+              }
             }
-          }
+          }, 0);
           return updated;
         });
       },
@@ -270,6 +279,27 @@ export default function App() {
         ...prev,
         rateLimitState: geminiRateLimit
       }));
+    });
+
+    derivProvider.setOnQuoteCallback((sym, bid, ask, timestampMs, lastChangedMs) => {
+      setLivePrices((prev) => ({
+        ...prev,
+        [sym]: { bid, ask, timestamp: timestampMs, lastChanged: lastChangedMs }
+      }));
+      setSymbolRegistry((prev) => {
+        if (!prev[sym]) return prev;
+        const pip = prev[sym].pipSize || 0.0001;
+        const spread = (ask - bid) / pip;
+        return {
+          ...prev,
+          [sym]: {
+            ...prev[sym],
+            currentBid: bid,
+            currentAsk: ask,
+            spreadPips: Number(spread.toFixed(1))
+          }
+        };
+      });
     });
 
     derivProviderRef.current = derivProvider;
@@ -303,28 +333,45 @@ export default function App() {
         }
       },
       (sym, closedCandles, formingCandle, isClosedUpdate) => {
-        setClosedCandlesMap((prev) => ({ ...prev, [sym]: closedCandles }));
-        setFormingCandlesMap((prev) => ({ ...prev, [sym]: formingCandle }));
-        const price = formingCandle ? formingCandle.close : closedCandles[closedCandles.length - 1]?.close;
-        if (price) {
-          const pip = symbolRegistry[sym]?.pipSize || 0.01;
-          const spread = pip * 2.0;
-          setLivePrices((prev) => ({
-            ...prev,
-            [sym]: {
-              bid: price,
-              ask: Number((price + spread).toFixed(symbolRegistry[sym]?.digits || 2))
-            }
-          }));
+        // Multi-symbol alias mapping so BTCUSD, SPYUSDT, QQQUSDT always match user views
+        const aliases = [sym];
+        if (sym === 'BTCUSDT' || sym === 'BTC/USDT' || sym === 'BTCUSD') {
+          aliases.push('BTCUSD', 'BTCUSDT', 'BTC/USDT');
+        } else if (sym === 'SPYUSDT' || sym === 'SPY/USDT' || sym === 'ES/MES') {
+          aliases.push('ES/MES', 'SPYUSDT', 'SPY/USDT');
+        } else if (sym === 'QQQUSDT' || sym === 'QQQ/USDT' || sym === 'NQ/NAS100') {
+          aliases.push('NQ/NAS100', 'QQQUSDT', 'QQQ/USDT');
+        }
 
-          // Track DATA PROOF for Binance symbol (Requirement 6)
-          const lastCandleIso = closedCandles.length > 0 
-            ? new Date(closedCandles[closedCandles.length - 1].time * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' UTC' 
-            : null;
-          setMarketDataConfig((prev) => {
-            const currentMap = prev.dataProofMap || {};
-            const existingProof = currentMap[sym] || {
-              symbol: sym,
+        setClosedCandlesMap((prev) => {
+          const next = { ...prev };
+          for (const a of aliases) {
+            next[a] = closedCandles;
+          }
+          return next;
+        });
+
+        setFormingCandlesMap((prev) => {
+          const next = { ...prev };
+          for (const a of aliases) {
+            next[a] = formingCandle;
+          }
+          return next;
+        });
+
+        const price = formingCandle ? formingCandle.close : closedCandles[closedCandles.length - 1]?.close;
+
+        // Track DATA PROOF for Binance symbols across aliases
+        const lastCandleIso = closedCandles.length > 0 
+          ? new Date(closedCandles[closedCandles.length - 1].time * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' UTC' 
+          : null;
+
+        setMarketDataConfig((prev) => {
+          const currentMap = prev.dataProofMap || {};
+          const nextMap = { ...currentMap };
+          for (const a of aliases) {
+            const existingProof = nextMap[a] || {
+              symbol: a,
               underlyingSymbol: toBinanceSymbol(sym),
               provider: 'BINANCE' as const,
               lastTickPrice: null,
@@ -335,27 +382,24 @@ export default function App() {
               lastCandleTimePerTimeframe: {},
               dataSourceType: 'LIVE_PROVEN' as const
             };
-
-            return {
-              ...prev,
-              dataProofMap: {
-                ...currentMap,
-                [sym]: {
-                  ...existingProof,
-                  lastTickPrice: price,
-                  lastTickEpoch: Date.now(),
-                  lastTickTimeUtc: new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
-                  ticksReceivedSinceLoad: existingProof.ticksReceivedSinceLoad + 1,
-                  lastCandleTimePerTimeframe: {
-                    ...existingProof.lastCandleTimePerTimeframe,
-                    [selectedTimeframe]: lastCandleIso
-                  },
-                  dataSourceType: 'LIVE_PROVEN' as const
-                }
-              }
+            nextMap[a] = {
+              ...existingProof,
+              lastTickPrice: price ?? existingProof.lastTickPrice,
+              lastTickEpoch: Date.now(),
+              lastTickTimeUtc: new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
+              ticksReceivedSinceLoad: existingProof.ticksReceivedSinceLoad + 1,
+              lastCandleTimePerTimeframe: {
+                ...existingProof.lastCandleTimePerTimeframe,
+                [selectedTimeframe]: lastCandleIso
+              },
+              dataSourceType: 'LIVE_PROVEN' as const
             };
-          });
-        }
+          }
+          return {
+            ...prev,
+            dataProofMap: nextMap
+          };
+        });
 
         // Requirement 5: Signals ONLY on closed candles (kline "x" flag), forming candle kept separate
         if (isClosedUpdate && closedCandles.length >= 20) {
@@ -393,6 +437,42 @@ export default function App() {
         }
       }
     );
+
+    binanceProvider.setOnQuoteCallback((sym, bid, ask, timestampMs, lastChangedMs) => {
+      const aliases = [sym];
+      if (sym === 'BTCUSDT' || sym === 'BTC/USDT' || sym === 'BTCUSD') {
+        aliases.push('BTCUSD', 'BTCUSDT', 'BTC/USDT');
+      } else if (sym === 'SPYUSDT' || sym === 'SPY/USDT' || sym === 'ES/MES') {
+        aliases.push('ES/MES', 'SPYUSDT', 'SPY/USDT');
+      } else if (sym === 'QQQUSDT' || sym === 'QQQ/USDT' || sym === 'NQ/NAS100') {
+        aliases.push('NQ/NAS100', 'QQQUSDT', 'QQQ/USDT');
+      }
+
+      setLivePrices((prev) => {
+        const next = { ...prev };
+        for (const a of aliases) {
+          next[a] = { bid, ask, timestamp: timestampMs, lastChanged: lastChangedMs };
+        }
+        return next;
+      });
+
+      setSymbolRegistry((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const a of aliases) {
+          if (next[a]) {
+            changed = true;
+            next[a] = {
+              ...next[a],
+              currentBid: bid,
+              currentAsk: ask,
+              spreadPips: Number((ask - bid).toFixed(next[a].digits || 2))
+            };
+          }
+        }
+        return changed ? next : prev;
+      });
+    });
 
     binanceProvider.setMarketType(binanceMarketType);
     binanceProvider.setSymbols(cryptoSymbols);
@@ -468,8 +548,10 @@ export default function App() {
   const activeFormingCandle = formingCandlesMap[selectedSymbol] || null;
 
   const currentLive = livePrices[selectedSymbol] || {
-    bid: currentSymbolInfo?.currentBid || 2742.50,
-    ask: currentSymbolInfo?.currentAsk || 2742.85
+    bid: currentSymbolInfo?.currentBid || 0,
+    ask: currentSymbolInfo?.currentAsk || 0,
+    timestamp: 0,
+    lastChanged: 0
   };
 
   // Evaluate Signals for all symbols
@@ -488,12 +570,11 @@ export default function App() {
       const candles = closedCandlesMap[sym] || (isSim ? generateCandles(sym, selectedTimeframe, 120) : []);
 
       if (candles && candles.length >= 20) {
-        const live = livePrices[sym]?.bid;
         const evaluated = evaluateTradingSignals(
           sym,
           candles,
           selectedTimeframe,
-          live,
+          undefined,
           symInfo.pipSize,
           symInfo.digits,
           {
@@ -523,7 +604,7 @@ export default function App() {
       }
     }
     return signalsList;
-  }, [closedCandlesMap, livePrices, symbolRegistry, selectedTimeframe, marketDataConfig.connected, marketDataConfig.isStale, marketDataConfig.simulationMode, binanceMarketType, marketDataConfig.binance.isStale, marketDataConfig.deriv.isStale, marketDataConfig.allowQuietHoursSignals]);
+  }, [closedCandlesMap, symbolRegistry, selectedTimeframe, marketDataConfig.connected, marketDataConfig.isStale, marketDataConfig.simulationMode, binanceMarketType, marketDataConfig.binance.isStale, marketDataConfig.deriv.isStale, marketDataConfig.allowQuietHoursSignals]);
 
   // Automatically record every signal in persistent storage (Forward Test Paper Execution)
   useEffect(() => {
@@ -617,12 +698,12 @@ export default function App() {
             minLot: 0.01,
             maxLot: 100.0,
             lotStep: 0.01,
-            currentBid: 100.0,
-            currentAsk: 100.1,
-            spreadPips: 1.0,
+            currentBid: 0,
+            currentAsk: 0,
+            spreadPips: 0,
             dayChangePercent: 0,
-            dayHigh: 105.0,
-            dayLow: 95.0,
+            dayHigh: 0,
+            dayLow: 0,
             isAvailable: true,
             exchangeIsOpen: true,
             isTradingSuspended: false,
@@ -826,6 +907,8 @@ export default function App() {
               onClearAuditedSignal={() => setAuditedSignal(null)}
               currentBid={currentLive.bid}
               currentAsk={currentLive.ask}
+              quoteTimestamp={currentLive.timestamp}
+              quoteLastChanged={currentLive.lastChanged}
               isConnected={marketDataConfig.connected}
               isSimulation={marketDataConfig.simulationMode}
               dataSource={currentSymbolInfo.provider}
@@ -837,6 +920,17 @@ export default function App() {
               onBinanceMarketTypeChange={handleBinanceMarketTypeChange}
               isBlockedRegion={currentSymbolInfo?.provider === 'BINANCE' && marketDataConfig.binance.isBlockedRegion}
               provider={currentSymbolInfo?.provider || 'DERIV'}
+              symbolDebugInfo={marketDataConfig.deriv.symbolDebugInfo[selectedSymbol]}
+              binanceErrorMessage={marketDataConfig.binance.errorMessage}
+              derivErrorMessage={marketDataConfig.deriv.errorMessage}
+              onRetryNow={() => {
+                if (currentSymbolInfo?.provider === 'BINANCE') {
+                  binanceProviderRef.current?.reconnect();
+                } else {
+                  derivProviderRef.current?.disconnect();
+                  derivProviderRef.current?.connect();
+                }
+              }}
             />
 
             {/* Signal Quick Banner under chart */}

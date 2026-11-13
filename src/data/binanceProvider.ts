@@ -15,6 +15,14 @@ export type OnBinanceCandlesCallback = (
 
 export type OnBinanceStatusCallback = (state: BinanceConnectionState) => void;
 
+export type OnBinanceQuoteCallback = (
+  symbol: string,
+  bid: number,
+  ask: number,
+  timestampMs: number,
+  lastChangedMs: number
+) => void;
+
 /**
  * Mapping from GREVIN Timeframe to Binance kline interval strings
  */
@@ -94,14 +102,25 @@ export class BinanceMarketDataProvider {
   // Candle Stores per symbol
   private closedCandlesMap: Record<string, Candle[]> = {};
   private formingCandlesMap: Record<string, Candle | null> = {};
+  private liveQuotesMap: Record<string, { bid: number; ask: number; timestamp: number; lastChanged: number }> = {};
 
   // Callbacks
   private onCandlesCallback: OnBinanceCandlesCallback | null = null;
   private onStatusCallback: OnBinanceStatusCallback | null = null;
+  private onQuoteCallback: OnBinanceQuoteCallback | null = null;
 
-  constructor(onStatus?: OnBinanceStatusCallback, onCandles?: OnBinanceCandlesCallback) {
+  constructor(
+    onStatus?: OnBinanceStatusCallback,
+    onCandles?: OnBinanceCandlesCallback,
+    onQuote?: OnBinanceQuoteCallback
+  ) {
     if (onStatus) this.onStatusCallback = onStatus;
     if (onCandles) this.onCandlesCallback = onCandles;
+    if (onQuote) this.onQuoteCallback = onQuote;
+  }
+
+  public setOnQuoteCallback(cb: OnBinanceQuoteCallback): void {
+    this.onQuoteCallback = cb;
   }
 
   public getState(): BinanceConnectionState {
@@ -331,6 +350,14 @@ export class BinanceMarketDataProvider {
 
       if (this.onCandlesCallback) {
         this.onCandlesCallback(displaySym, sorted, this.formingCandlesMap[symbol] || null, false);
+        this.onCandlesCallback(symbol, sorted, this.formingCandlesMap[symbol] || null, false);
+        if (symbol === 'BTCUSDT') {
+          this.onCandlesCallback('BTCUSD', sorted, this.formingCandlesMap[symbol] || null, false);
+        } else if (symbol === 'SPYUSDT') {
+          this.onCandlesCallback('ES/MES', sorted, this.formingCandlesMap[symbol] || null, false);
+        } else if (symbol === 'QQQUSDT') {
+          this.onCandlesCallback('NQ/NAS100', sorted, this.formingCandlesMap[symbol] || null, false);
+        }
       }
 
       return sorted;
@@ -421,15 +448,15 @@ export class BinanceMarketDataProvider {
   }
 
   /**
-   * Opens combined WebSocket stream for all active symbols
+   * Opens combined WebSocket stream for all active symbols (klines + live bookTickers)
    */
   private openWebSocket(): void {
     if (this.manualDisconnect) return;
 
     const interval = getBinanceInterval(this.activeTimeframe);
-    const streamNames = this.symbols
-      .map(s => `${s.toLowerCase()}@kline_${interval}`)
-      .join('/');
+    const klineStreams = this.symbols.map(s => `${s.toLowerCase()}@kline_${interval}`);
+    const tickerStreams = this.symbols.map(s => `${s.toLowerCase()}@bookTicker`);
+    const streamNames = [...klineStreams, ...tickerStreams].join('/');
 
     const wsUrl = this.marketType === 'SPOT'
       ? `wss://stream.binance.com:9443/stream?streams=${streamNames}`
@@ -511,11 +538,61 @@ export class BinanceMarketDataProvider {
       // Binance combined stream payload: { stream: "btcusdt@kline_15m", data: { ... } }
       // Or single stream payload: { e: "kline", s: "BTCUSDT", k: { ... } }
       const data = payload.data || payload;
+
+      // Kline Candle Update
       if (data.e === 'kline' && data.k) {
         this.processKlineEvent(data.s, data.k);
+        return;
+      }
+
+      // BookTicker Real Quote Update (Requirement 1: BID/ASK must come only from live provider)
+      if ((data.e === 'bookTicker' || (data.b && data.a && data.s)) && !data.k) {
+        this.processBookTickerEvent(data.s, data.b, data.a);
+        return;
       }
     } catch {
       // ignore malformed payloads
+    }
+  }
+
+  /**
+   * Processes a live best bid/ask bookTicker event from Binance
+   */
+  private processBookTickerEvent(symbol: string, rawBid: string | number, rawAsk: string | number): void {
+    const bid = typeof rawBid === 'number' ? rawBid : parseFloat(rawBid);
+    const ask = typeof rawAsk === 'number' ? rawAsk : parseFloat(rawAsk);
+    if (isNaN(bid) || isNaN(ask) || bid <= 0 || ask <= 0) return;
+
+    const now = Date.now();
+    this.state.lastUpdate = now;
+    this.state.isStale = false;
+
+    const upper = symbol.toUpperCase();
+    const prevQuote = this.liveQuotesMap[upper];
+    let lastChanged = now;
+    if (prevQuote && prevQuote.bid === bid && prevQuote.ask === ask) {
+      lastChanged = prevQuote.lastChanged || now;
+    }
+
+    this.liveQuotesMap[upper] = {
+      bid,
+      ask,
+      timestamp: now,
+      lastChanged
+    };
+
+    if (this.onQuoteCallback) {
+      this.onQuoteCallback(upper, bid, ask, now, lastChanged);
+      const display = toDisplaySymbol(upper);
+      this.onQuoteCallback(display, bid, ask, now, lastChanged);
+
+      if (upper === 'BTCUSDT') {
+        this.onQuoteCallback('BTCUSD', bid, ask, now, lastChanged);
+      } else if (upper === 'SPYUSDT') {
+        this.onQuoteCallback('ES/MES', bid, ask, now, lastChanged);
+      } else if (upper === 'QQQUSDT') {
+        this.onQuoteCallback('NQ/NAS100', bid, ask, now, lastChanged);
+      }
     }
   }
 
@@ -554,6 +631,12 @@ export class BinanceMarketDataProvider {
 
     const displaySym = toDisplaySymbol(upperSym);
 
+    const emitCandles = (symKey: string, closed: Candle[], forming: Candle | null, isClosedFlag: boolean) => {
+      if (this.onCandlesCallback) {
+        this.onCandlesCallback(symKey, closed, forming, isClosedFlag);
+      }
+    };
+
     if (isClosed) {
       // 1. CANDLE CLOSED: Append to closed series, clear forming candle
       const existing = this.closedCandlesMap[upperSym] || [];
@@ -564,19 +647,23 @@ export class BinanceMarketDataProvider {
       this.closedCandlesMap[upperSym] = trimmed;
       this.formingCandlesMap[upperSym] = null;
 
-      // Trigger callback with isClosedUpdate = TRUE (signal engine runs on this)
-      if (this.onCandlesCallback) {
-        this.onCandlesCallback(displaySym, trimmed, null, true);
-      }
+      // Trigger callback with isClosedUpdate = TRUE for all symbol aliases
+      emitCandles(displaySym, trimmed, null, true);
+      emitCandles(upperSym, trimmed, null, true);
+      if (upperSym === 'BTCUSDT') emitCandles('BTCUSD', trimmed, null, true);
+      if (upperSym === 'SPYUSDT') emitCandles('ES/MES', trimmed, null, true);
+      if (upperSym === 'QQQUSDT') emitCandles('NQ/NAS100', trimmed, null, true);
     } else {
       // 2. CANDLE FORMING: Update forming candle separately
       this.formingCandlesMap[upperSym] = candle;
       const closedList = this.closedCandlesMap[upperSym] || [];
 
-      // Trigger callback with isClosedUpdate = FALSE (chart updates, no new signals)
-      if (this.onCandlesCallback) {
-        this.onCandlesCallback(displaySym, closedList, candle, false);
-      }
+      // Trigger callback with isClosedUpdate = FALSE for all symbol aliases
+      emitCandles(displaySym, closedList, candle, false);
+      emitCandles(upperSym, closedList, candle, false);
+      if (upperSym === 'BTCUSDT') emitCandles('BTCUSD', closedList, candle, false);
+      if (upperSym === 'SPYUSDT') emitCandles('ES/MES', closedList, candle, false);
+      if (upperSym === 'QQQUSDT') emitCandles('NQ/NAS100', closedList, candle, false);
     }
   }
 

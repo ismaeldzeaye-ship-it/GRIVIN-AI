@@ -1,7 +1,8 @@
-import { TradingSignal, RateLimitState } from '../types';
+import { TradingSignal, RateLimitState, StructuredMarketEvidence, Candle } from '../types';
+import { MarketState, AiAnalysisCache } from './aiCache';
 
-// In-memory cache per signal ID (Requirement 4: never call on every tick or candle)
-const aiExplanationCache: Map<string, string> = new Map();
+// Global AI Analysis Cache instance using MarketState keying (5-minute TTL, 50 entries)
+export const aiAnalysisCache = new AiAnalysisCache<string>(5 * 60_000, 50);
 
 // Global listener for rate-limit updates
 type RateLimitListener = (state: RateLimitState) => void;
@@ -17,25 +18,124 @@ function notifyRateLimit(state: RateLimitState) {
 }
 
 /**
- * Runs AI explanation only when a signal is created or when tapped "Explain".
- * Cached per signal ID; never calls network if already in cache.
- * Signals NEVER depend on the AI.
+ * Builds a normalized MarketState from existing signal, evidence, and candle variables.
+ * Uses strictly the last CLOSED candle time (not the forming candle).
  */
-export async function requestAISetupAnalysis(signal: TradingSignal): Promise<string> {
+export function buildMarketState(
+  signal: TradingSignal,
+  evidence?: StructuredMarketEvidence,
+  candles?: Candle[]
+): MarketState {
+  // Use last CLOSED candle time (never the forming candle)
+  let lastClosedCandleTime = 0;
+  if (candles && candles.length > 0) {
+    const closed = candles.filter(c => !c.isForming);
+    if (closed.length > 0) {
+      lastClosedCandleTime = closed[closed.length - 1].time;
+    }
+  }
+  if (!lastClosedCandleTime) {
+    lastClosedCandleTime = signal.signalCandleTime || Math.floor((signal.timestamp || Date.now()) / 1000);
+  }
+
+  // Calculate pocBin from volume profile or audit levels
+  let pocBin = 0;
+  const pocPrice = evidence?.volumeProfile?.poc ?? signal.auditLevels?.poc;
+  if (pocPrice !== undefined && pocPrice !== null) {
+    if (evidence?.volumeProfile?.vah && evidence?.volumeProfile?.val && evidence.volumeProfile.vah > evidence.volumeProfile.val) {
+      const step = (evidence.volumeProfile.vah - evidence.volumeProfile.val) / 60;
+      pocBin = step > 0 ? Math.floor((pocPrice - evidence.volumeProfile.val) / step) : Math.round(pocPrice);
+    } else {
+      pocBin = Math.round(pocPrice);
+    }
+  }
+
+  // Determine current market zone
+  const zone = evidence?.smc?.premiumDiscount?.currentZone ||
+    evidence?.volumeProfile?.priceRelation ||
+    (signal.marketState ? String(signal.marketState) : (signal.entryPrice >= (signal.auditLevels?.poc ?? signal.entryPrice) ? 'PREMIUM' : 'DISCOUNT'));
+
+  // FVG count from SMC evidence or checklist
+  const fvgCount = evidence?.smc?.activeFVGs ??
+    (signal.checklist?.some(item => (item.id.includes('fvg') || item.label.toLowerCase().includes('fvg')) && item.passed) ? 1 : 0);
+
+  // Structure event ID
+  const structureEventId = evidence?.marketStructure?.lastBOS
+    ? `BOS-${evidence.marketStructure.lastBOS.time}`
+    : evidence?.marketStructure?.lastCHOCH
+    ? `CHOCH-${evidence.marketStructure.lastCHOCH.time}`
+    : signal.id;
+
+  return {
+    symbol: signal.symbol,
+    timeframe: signal.timeframe,
+    session: signal.session || 'REGULAR',
+    lastClosedCandleTime,
+    pocBin,
+    zone,
+    fvgCount,
+    structureEventId,
+    direction: signal.direction,
+    strategyName: signal.strategyName || signal.strategy || 'unknown'
+  };
+}
+
+/**
+ * Runs AI explanation routed through the AiAnalysisCache.
+ * Supports { force: true } to bypass cache and fetch a fresh analysis.
+ */
+export async function requestAISetupAnalysis(
+  signal: TradingSignal,
+  evidenceOrOpts?: StructuredMarketEvidence | { force?: boolean },
+  optsOrCandles?: { force?: boolean } | Candle[],
+  candlesParam?: Candle[]
+): Promise<string> {
   if (!signal || !signal.id) {
     return 'Signal not available for AI explanation.';
   }
 
-  // 1. Check in-memory cache
-  if (aiExplanationCache.has(signal.id)) {
-    return aiExplanationCache.get(signal.id)!;
+  let evidence: StructuredMarketEvidence | undefined;
+  let opts: { force?: boolean } = {};
+  let candles: Candle[] | undefined;
+
+  if (evidenceOrOpts && 'force' in evidenceOrOpts) {
+    opts = evidenceOrOpts as { force?: boolean };
+  } else if (evidenceOrOpts) {
+    evidence = evidenceOrOpts as StructuredMarketEvidence;
   }
 
+  if (optsOrCandles && 'force' in optsOrCandles) {
+    opts = optsOrCandles as { force?: boolean };
+  } else if (Array.isArray(optsOrCandles)) {
+    candles = optsOrCandles;
+  }
+
+  if (Array.isArray(candlesParam)) {
+    candles = candlesParam;
+  }
+
+  const marketState = buildMarketState(signal, evidence, candles);
+
+  const { value } = await aiAnalysisCache.get(
+    marketState,
+    async () => {
+      return executeGeminiAnalysisFetch(signal, evidence);
+    },
+    opts
+  );
+
+  return value;
+}
+
+async function executeGeminiAnalysisFetch(
+  signal: TradingSignal,
+  evidence?: StructuredMarketEvidence
+): Promise<string> {
   try {
     const res = await fetch('/api/ai/analyze-setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ signal })
+      body: JSON.stringify({ signal, evidence })
     });
 
     if (res.status === 429) {
@@ -48,15 +148,12 @@ export async function requestAISetupAnalysis(signal: TradingSignal): Promise<str
         status: 'Rate-limited, retrying',
         lastEventTime: Date.now()
       });
-      const unavailableMsg = 'AI explanation temporarily unavailable';
-      aiExplanationCache.set(signal.id, unavailableMsg);
-      return unavailableMsg;
+      return 'AI explanation temporarily unavailable';
     }
 
     if (res.ok) {
       const data = await res.json();
       if (data.analysis) {
-        aiExplanationCache.set(signal.id, data.analysis);
         notifyRateLimit({
           serviceName: 'Gemini AI',
           fullMessage: null,
@@ -77,16 +174,12 @@ export async function requestAISetupAnalysis(signal: TradingSignal): Promise<str
         status: 'Rate-limited, retrying',
         lastEventTime: Date.now()
       });
-      const msg = 'AI explanation temporarily unavailable';
-      aiExplanationCache.set(signal.id, msg);
-      return msg;
+      return 'AI explanation temporarily unavailable';
     }
   }
 
   // Fallback to deterministic algorithmic explanation (never breaks execution)
-  const fallback = generateHeuristicAnalysis(signal);
-  aiExplanationCache.set(signal.id, fallback);
-  return fallback;
+  return generateHeuristicAnalysis(signal);
 }
 
 export function generateHeuristicAnalysis(signal: TradingSignal): string {

@@ -1,4 +1,4 @@
-import { Candle, SMCZone, Timeframe } from '../types';
+import { Candle, SMCZone, Timeframe, EqualHighLowPool, DisplacementBar, PremiumDiscountZone } from '../types';
 
 /**
  * Detects Fair Value Gaps (FVG):
@@ -173,4 +173,171 @@ export function detectLiquiditySweep(
     }
   }
   return { swept: false, candleIndex: -1, sweepPrice: 0 };
+}
+
+/**
+ * Detects Equal Highs (EQH) or Equal Lows (EQL) liquidity pools.
+ * Two or more swing points within a tight tolerance (default: 0.15% or pip tolerance)
+ * represent unmitigated buy-side or sell-side liquidity resting above/below.
+ */
+export function detectEqualHighsLows(
+  candles: Candle[],
+  tolerancePercent = 0.08,
+  lookback = 40,
+  window?: number
+): { eqhPools: EqualHighLowPool[]; eqlPools: EqualHighLowPool[] } {
+  const eqhPools: EqualHighLowPool[] = [];
+  const eqlPools: EqualHighLowPool[] = [];
+  if (candles.length < 5) return { eqhPools, eqlPools };
+
+  const w = window !== undefined ? window : (candles.length < 20 ? 1 : 2);
+  const startIdx = Math.max(0, candles.length - lookback);
+  const subset = candles.slice(startIdx);
+
+  // Identify local pivot highs and lows
+  const swingHighs: { price: number; index: number; time: number }[] = [];
+  const swingLows: { price: number; index: number; time: number }[] = [];
+
+  for (let i = w; i < subset.length - w; i++) {
+    const c = subset[i];
+    let isHigh = true;
+    let isLow = true;
+    for (let k = 1; k <= w; k++) {
+      if (c.high < subset[i - k].high || c.high < subset[i + k].high) isHigh = false;
+      if (c.low > subset[i - k].low || c.low > subset[i + k].low) isLow = false;
+    }
+
+    if (isHigh) swingHighs.push({ price: c.high, index: startIdx + i, time: c.time });
+    if (isLow) swingLows.push({ price: c.low, index: startIdx + i, time: c.time });
+  }
+
+  // Group equal highs
+  for (let i = 0; i < swingHighs.length; i++) {
+    const matched = [swingHighs[i]];
+    for (let j = i + 1; j < swingHighs.length; j++) {
+      const diffPercent = Math.abs(swingHighs[i].price - swingHighs[j].price) / swingHighs[i].price * 100;
+      if (diffPercent <= tolerancePercent) {
+        matched.push(swingHighs[j]);
+      }
+    }
+    if (matched.length >= 2) {
+      const avgPrice = matched.reduce((sum, h) => sum + h.price, 0) / matched.length;
+      const lastCandle = candles[candles.length - 1];
+      const swept = lastCandle.high > avgPrice;
+      eqhPools.push({
+        id: `EQH-${matched[0].index}`,
+        type: 'EQH',
+        price: Number(avgPrice.toFixed(4)),
+        count: matched.length,
+        indices: matched.map(m => m.index),
+        time: matched[matched.length - 1].time,
+        swept
+      });
+    }
+  }
+
+  // Group equal lows
+  for (let i = 0; i < swingLows.length; i++) {
+    const matched = [swingLows[i]];
+    for (let j = i + 1; j < swingLows.length; j++) {
+      const diffPercent = Math.abs(swingLows[i].price - swingLows[j].price) / swingLows[i].price * 100;
+      if (diffPercent <= tolerancePercent) {
+        matched.push(swingLows[j]);
+      }
+    }
+    if (matched.length >= 2) {
+      const avgPrice = matched.reduce((sum, l) => sum + l.price, 0) / matched.length;
+      const lastCandle = candles[candles.length - 1];
+      const swept = lastCandle.low < avgPrice;
+      eqlPools.push({
+        id: `EQL-${matched[0].index}`,
+        type: 'EQL',
+        price: Number(avgPrice.toFixed(4)),
+        count: matched.length,
+        indices: matched.map(m => m.index),
+        time: matched[matched.length - 1].time,
+        swept
+      });
+    }
+  }
+
+  return { eqhPools, eqlPools };
+}
+
+/**
+ * Detects institutional displacement bars (strong expansion with body > 1.8x recent average range).
+ */
+export function detectDisplacement(
+  candles: Candle[],
+  lookback = 14,
+  expansionFactor = 1.8
+): DisplacementBar[] {
+  const displacements: DisplacementBar[] = [];
+  if (candles.length < lookback + 1) return displacements;
+
+  for (let i = lookback; i < candles.length; i++) {
+    const target = candles[i];
+    const prevRange = candles.slice(i - lookback, i);
+    const avgBody = prevRange.reduce((acc, c) => acc + Math.abs(c.close - c.open), 0) / lookback;
+
+    const currentBody = Math.abs(target.close - target.open);
+    const totalRange = target.high - target.low;
+    const bodyToRangeRatio = totalRange > 0 ? currentBody / totalRange : 0;
+
+    // Displacement requires both expansion over average body AND solid body (>65% of total candle range)
+    if (currentBody >= avgBody * expansionFactor && bodyToRangeRatio >= 0.65) {
+      displacements.push({
+        index: i,
+        time: target.time,
+        direction: target.close > target.open ? 'BULLISH' : 'BEARISH',
+        bodyRatio: Number((currentBody / Math.max(0.0001, avgBody)).toFixed(2)),
+        candle: target
+      });
+    }
+  }
+
+  return displacements;
+}
+
+/**
+ * Calculates dealing range Premium vs Discount zones (0–50% Discount, 50% Equilibrium, 50–100% Premium).
+ */
+export function calculatePremiumDiscount(
+  candles: Candle[],
+  currentPrice?: number,
+  lookback = 40
+): PremiumDiscountZone | null {
+  if (candles.length < 5) return null;
+
+  const subset = candles.slice(-lookback);
+  let rangeHigh = -Infinity;
+  let rangeLow = Infinity;
+
+  for (const c of subset) {
+    if (c.high > rangeHigh) rangeHigh = c.high;
+    if (c.low < rangeLow) rangeLow = c.low;
+  }
+
+  if (rangeHigh <= rangeLow || !isFinite(rangeHigh) || !isFinite(rangeLow)) {
+    return null;
+  }
+
+  const equilibrium = (rangeHigh + rangeLow) / 2;
+  const price = currentPrice !== undefined ? currentPrice : subset[subset.length - 1].close;
+  const percentile = Math.min(100, Math.max(0, ((price - rangeLow) / (rangeHigh - rangeLow)) * 100));
+
+  let currentZone: PremiumDiscountZone['currentZone'] = 'EQUILIBRIUM';
+  if (percentile >= 52) {
+    currentZone = 'PREMIUM';
+  } else if (percentile <= 48) {
+    currentZone = 'DISCOUNT';
+  }
+
+  return {
+    rangeHigh: Number(rangeHigh.toFixed(4)),
+    rangeLow: Number(rangeLow.toFixed(4)),
+    equilibrium: Number(equilibrium.toFixed(4)),
+    currentZone,
+    percentile: Number(percentile.toFixed(1))
+  };
 }
